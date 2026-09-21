@@ -888,7 +888,7 @@ Ray Data interoperates with PyTorch and TensorFlow datasets.
 Reading databases
 =================
 
-Ray Data reads from databases like MySQL, PostgreSQL, MongoDB, and BigQuery.
+Ray Data reads from databases like MySQL, PostgreSQL, MongoDB, BigQuery, and HiveServer2.
 
 .. _reading_sql:
 
@@ -1081,6 +1081,48 @@ Call :func:`~ray.data.read_sql` to read data from a database that provides a
                 dataset="destination_dataset.destination_table",
                 overwrite_table=True,
             )
+
+Reading Hive through HiveServer2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the optional `Impyla <https://github.com/cloudera/impyla>`_ dependency in
+both the driver and worker runtime environments:
+
+.. code-block:: console
+
+    pip install "impyla==0.24.0" "thrift==0.24.0" "thrift-sasl==0.4.3"
+
+Read a Hive table or view through HiveServer2. The initial datasource reads
+through one sequential HS2 result stream and does not give Ray workers direct
+access to Hive Metastore or table storage:
+
+.. code-block:: python
+
+    import ray
+
+    ds = ray.data.read_hive(
+        "default.users",
+        host="hive-server",
+        auth_mechanism="PLAIN",
+        user="ray",
+        password="<password>",
+        use_ssl=True,
+    )
+
+For Kerberos, set up the ticket and Kerberos configuration in the runtime
+environment, then select ``auth_mechanism="GSSAPI"``. SASL PLAIN does not
+encrypt credentials; enable TLS when using it. Ray verifies the server
+certificate and accepts ``ca_cert`` when a custom CA is required.
+
+Raw SQL is trusted caller input and requires an explicit Arrow schema. The
+reader fetches bounded result batches and rejects an individual HS2 response
+that exceeds its internal byte ceiling instead of buffering an unbounded row or
+response. ``Dataset.limit()`` remains a downstream Ray Data operation.
+
+The initial implementation supports the ``NOSASL``, ``PLAIN`` (Hive ``NONE``),
+and ``GSSAPI`` profiles. LDAP and HTTP transport profiles, direct storage reads,
+and Hive writes are separate follow-up work.
+
 
 .. _reading_mongodb:
 

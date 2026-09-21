@@ -288,6 +288,15 @@ Python Objects
 
    from_items
 
+HiveServer2
+^^^^^^^^^^^
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_hive
+
 SQL Databases
 ^^^^^^^^^^^^^
 

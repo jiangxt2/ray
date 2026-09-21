@@ -504,6 +504,8 @@ def _read_datasource_v2(
     label_selector: Optional[Dict[str, str]] = None,
     fallback_strategy: Optional[List[Dict[str, Any]]] = None,
     max_calls: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    target_max_block_size_override: Optional[int] = None,
     resources: Optional[Dict[str, float]] = None,
     accelerator_type: Optional[str] = None,
     runtime_env: Optional[Dict[str, Any]] = None,
@@ -563,6 +565,26 @@ def _read_datasource_v2(
         runtime_env=runtime_env,
         ctx=ctx,
     )
+    # This internal hook lets strict streaming sources disable task replay
+    # without exposing a generic retry override on their public API.
+    if max_retries is not None:
+        ray_remote_args["max_retries"] = max_retries
+
+    target_max_block_size = ctx.target_max_block_size
+    if target_max_block_size_override is not None:
+        if (
+            isinstance(target_max_block_size_override, bool)
+            or not isinstance(target_max_block_size_override, int)
+            or target_max_block_size_override <= 0
+        ):
+            raise ValueError(
+                "target_max_block_size_override must be a positive integer"
+            )
+        target_max_block_size = (
+            min(target_max_block_size, target_max_block_size_override)
+            if target_max_block_size is not None
+            else target_max_block_size_override
+        )
 
     pruners = _build_pruners(datasource.file_extensions, partition_filter)
 
@@ -598,6 +620,7 @@ def _read_datasource_v2(
         schema=schema,
         filesystem=datasource.filesystem,
         partitioning=resolved_partitioning,
+        target_max_block_size=target_max_block_size,
     )
 
     # Size-balanced bucketing for the listing output. The partitioner is
@@ -614,9 +637,7 @@ def _read_datasource_v2(
 
     min_bucket_size = ctx.target_min_block_size or 0
     max_bucket_size = (
-        ctx.target_max_block_size
-        if ctx.target_max_block_size is not None
-        else sys.maxsize
+        target_max_block_size if target_max_block_size is not None else sys.maxsize
     )
     # ``parallelism`` is the caller-resolved ``override_num_blocks`` value
     # (``-1`` when unset). Honoring it here per-read avoids mutating the
@@ -668,7 +689,9 @@ def _read_datasource_v2(
     )
 
     stats = DatasetStats(metadata={"ReadFiles": []}, parent=None)
-    context = DataContext.get_current().copy()
+    context = ctx.copy()
+    if target_max_block_size_override is not None:
+        context.target_max_block_size = target_max_block_size
     logical_plan = LogicalPlan(read_op, context)
 
     return Dataset(
@@ -4030,6 +4053,117 @@ def read_sql(
         runtime_env=runtime_env,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,
+    )
+
+
+@PublicAPI(stability="alpha")
+def read_hive(
+    table: Optional[str] = None,
+    *,
+    host: str,
+    query: Optional[str] = None,
+    schema: Optional["pyarrow.Schema"] = None,
+    port: int = 10000,
+    auth_mechanism: str = "NOSASL",
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+    kerberos_service_name: str = "hive",
+    use_ssl: bool = False,
+    ca_cert: Optional[str] = None,
+    timeout: Optional[float] = None,
+    limit: Optional[int] = None,
+) -> Dataset:
+    """Read a Hive relation or trusted SQL query through HiveServer2.
+
+    A table read resolves schema through HiveServer2 metadata and submits one
+    data query from one Ray Data V2 reader. Raw SQL requires an explicit Arrow
+    schema; Ray does not execute a planning query to infer it. The reader
+    consumes bounded HS2 batches and fails closed if one response exceeds its
+    internal byte limit. Results are not transparently retried or routed to a
+    second reader.
+
+    The validated optional HS2 client stack (Impyla 0.24.0, Thrift 0.24.0,
+    and thrift-sasl 0.4.3) must be installed in the driver and worker runtime
+    environments. The bounded adapter relies on this tested stack. The initial
+    authentication profiles are ``NOSASL``, ``PLAIN`` (Hive ``NONE``), and
+    ``GSSAPI`` (Kerberos). Kerberos credentials are provisioned by the runtime
+    environment. SASL PLAIN does not encrypt credentials; enable TLS when using
+    it. TLS certificate verification is always enabled, and ``ca_cert`` selects
+    a custom CA bundle.
+
+    Args:
+        table: Table or view name, optionally qualified by database. Specify
+            exactly one of ``table`` or ``query``.
+        host: HiveServer2 host name.
+        query: Trusted caller-supplied SQL. Requires ``schema`` and is mutually
+            exclusive with ``table``.
+        schema: Arrow schema for a raw SQL query. Table reads resolve their
+            schema from HiveServer2 metadata.
+        port: HiveServer2 binary protocol port.
+        auth_mechanism: ``NOSASL``, ``PLAIN``, or ``GSSAPI``.
+        user: Session user for ``NOSASL``/``PLAIN``; optional for Kerberos.
+        password: Password for ``PLAIN`` authentication.
+        kerberos_service_name: Kerberos service name for ``GSSAPI``.
+        use_ssl: Use TLS for the HiveServer2 connection. Enable it with PLAIN
+            authentication to protect credentials in transit.
+        ca_cert: Optional CA certificate file used to verify the server.
+        timeout: Optional connection timeout in seconds.
+        limit: Source-level row limit for table reads. ``Dataset.limit()`` is
+            still applied as a separate downstream operation.
+
+    Returns:
+        A :class:`Dataset` whose rows are read sequentially from HiveServer2.
+
+    Examples:
+        Read a table or view:
+
+        >>> import ray
+        >>> ds = ray.data.read_hive( # doctest: +SKIP
+        ...     "default.users", host="hive-server"
+        ... )
+
+        Read trusted SQL with an explicit result schema:
+
+        >>> import pyarrow as pa
+        >>> ds = ray.data.read_hive( # doctest: +SKIP
+        ...     host="hive-server",
+        ...     query="SELECT id, name FROM default.users",
+        ...     schema=pa.schema([("id", pa.int64()), ("name", pa.string())]),
+        ... )
+    """
+    from ray.data._internal.datasource.hive_hs2_client import HiveConnectionOptions
+    from ray.data._internal.datasource_v2.hive_datasource import HiveDatasourceV2
+    from ray.data._internal.datasource_v2.readers.hive_reader import (
+        DEFAULT_HIVE_TARGET_BATCH_BYTES,
+        DEFAULT_HIVE_TASK_MEMORY_BYTES,
+    )
+
+    options = HiveConnectionOptions(
+        host=host,
+        port=port,
+        auth_mechanism=auth_mechanism,
+        user=user,
+        password=password,
+        kerberos_service_name=kerberos_service_name,
+        use_ssl=use_ssl,
+        ca_cert=ca_cert,
+        timeout=timeout,
+    )
+    datasource = HiveDatasourceV2(
+        host=host,
+        port=port,
+        connection_options=options,
+        table=table,
+        query=query,
+        schema=schema,
+        source_limit=limit,
+    )
+    return _read_datasource_v2(
+        datasource,
+        parallelism=1,
+        max_retries=0,
+        memory=DEFAULT_HIVE_TASK_MEMORY_BYTES,
+        target_max_block_size_override=DEFAULT_HIVE_TARGET_BATCH_BYTES,
     )
 
 

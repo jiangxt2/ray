@@ -1100,6 +1100,35 @@ py_test(
 )
 
 py_test(
+    name = "test_read_hive",
+    size = "small",
+    srcs = ["tests/datasource/test_read_hive.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_hive_integration",
+    size = "large",
+    srcs = ["tests/datasource/test_hive_integration.py"],
+    tags = [
+        "data_integration",
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_read_parquet_v2",
     size = "small",
     srcs = ["tests/datasource/test_read_parquet_v2.py"],
