@@ -885,6 +885,58 @@ Ray Data interoperates with PyTorch and TensorFlow datasets.
                }
             )
 
+Reading catalog-backed lakehouse tables
+=======================================
+
+Ray Data can resolve Iceberg and registered external Delta tables through the
+optional ``apache-gravitino`` Python package.
+Install the client:
+
+.. code-block:: console
+
+    pip install apache-gravitino
+
+Configure the metadata API and Iceberg REST endpoint separately. If the
+services require authentication, configure the metadata API's
+``auth_data_provider`` and pass REST-specific PyIceberg properties in
+``iceberg_rest_catalog_kwargs``. Set ``client_config`` to adjust the Gravitino
+metadata request timeout in seconds when a catalog backend is slow; for example,
+``{"gravitino_client_request_timeout": 30}``. Don't embed credentials in
+endpoint URIs.
+
+.. testcode::
+    :skipif: True
+
+    import ray
+
+    catalog = ray.data.GravitinoCatalog(
+        gravitino_uri="http://gravitino:8090",
+        metalake_name="production",
+        iceberg_rest_uri="http://gravitino:9001/iceberg/",
+    )
+
+    # The identifier is catalog.schema.table.
+    iceberg = ray.data.read_iceberg(
+        table_identifier="iceberg_catalog.sales.orders", catalog=catalog
+    )
+    delta = ray.data.read_delta("lakehouse_catalog.sales.events", catalog=catalog)
+    # Ray writes to existing Iceberg tables through the same REST catalog.
+    ray.data.from_items([{"id": 1}]).write_iceberg(
+        "iceberg_catalog.sales.orders", catalog=catalog
+    )
+
+For version 1.3.0, Delta reads require a table in a generic lakehouse catalog
+registered with ``format=delta``, ``external=true``, and a table-level
+``location``. The metadata client resolves this information. The service
+doesn't vend storage credentials for external Delta tables in generic lakehouse
+catalogs. Configure the storage identity on every Ray worker. Delta writes and
+Parquet access through ``GravitinoCatalog`` are not supported.
+
+Iceberg catalog discovery uses the dynamic catalog configuration provider on
+the REST service. Configure that provider and select tables with
+``catalog.schema.table``. Configure authorization on the REST service and
+storage access in its backing catalog.
+
 Reading databases
 =================
 

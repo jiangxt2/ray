@@ -12,7 +12,7 @@ from dataclasses import KW_ONLY, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from ray.util.annotations import DeveloperAPI, PublicAPI
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         TableInfo,
         TableOperation,
     )
+    from gravitino.auth.auth_data_provider import AuthDataProvider
 
     from ray.data._internal.datasource.databricks_credentials import (
         DatabricksCredentialProvider,
@@ -451,3 +452,297 @@ class DatabricksUnityCatalog(Catalog):
             raise ValueError("Azure UC credentials missing a SAS token.")
         creds: Dict[str, Optional[str]] = {_AZURE_STORAGE_SAS_TOKEN: sas_token}
         return creds
+
+
+@PublicAPI(stability="alpha")
+@dataclass(frozen=True)
+class GravitinoCatalog(Catalog):
+    """Resolve Iceberg and registered external Delta tables.
+
+    The Gravitino main API resolves the logical catalog and table metadata. Iceberg
+    operations then use the separate Gravitino Iceberg REST endpoint through
+    PyIceberg. Delta reads use the table's registered ``location`` and the
+    storage credentials already configured for Ray workers.
+
+    The optional ``apache-gravitino`` client is imported only when ``resolve`` is
+    called. Authentication for the main API and Iceberg REST service is configured
+    independently.
+
+    Args:
+        gravitino_uri: Base URI of the Gravitino main API.
+        metalake_name: Metalake containing the catalogs to resolve.
+        iceberg_rest_uri: Gravitino Iceberg REST endpoint, for example
+            ``"http://gravitino:9001/iceberg/"``.
+        auth_data_provider: Optional Gravitino Python client authentication
+            provider. This authenticates requests to the main Gravitino API.
+        client_config: Optional Gravitino 1.3 client configuration. It currently
+            supports only ``gravitino_client_request_timeout``, a non-negative
+            integer number of seconds.
+        iceberg_rest_catalog_kwargs: Optional PyIceberg REST catalog properties,
+            such as OAuth credentials for the Iceberg REST endpoint.
+
+    Example:
+        >>> import ray
+        >>> catalog = ray.data.GravitinoCatalog(  # doctest: +SKIP
+        ...     gravitino_uri="http://gravitino:8090",
+        ...     metalake_name="production",
+        ...     iceberg_rest_uri="http://gravitino:9001/iceberg/",
+        ... )
+        >>> ds = ray.data.read_iceberg(  # doctest: +SKIP
+        ...     table_identifier="iceberg_catalog.sales.orders", catalog=catalog
+        ... )
+        >>> delta = ray.data.read_delta(  # doctest: +SKIP
+        ...     "lakehouse_catalog.sales.orders", catalog=catalog
+        ... )
+
+    Note:
+        Gravitino 1.3.0 supports external Delta table metadata, but does not vend
+        storage credentials for Generic Lakehouse Delta tables. Configure the
+        storage identity on the Ray workers. Delta writes are unsupported because
+        Gravitino 1.3.0 does not support ALTER for external Delta tables, so table
+        metadata consistency cannot be guaranteed after a write.
+        Parquet access through this catalog is unsupported.
+        Authentication configuration is omitted when the Catalog is pickled;
+        recreate it before resolving from a deserialized instance.
+    """
+
+    _: KW_ONLY
+    gravitino_uri: str
+    metalake_name: str
+    iceberg_rest_uri: str
+    # These fields may contain credentials. Keep them out of repr and equality.
+    auth_data_provider: Optional["AuthDataProvider"] = field(
+        default=None, repr=False, compare=False
+    )
+    client_config: Optional[Dict[str, int]] = field(
+        default=None, repr=False, compare=False
+    )
+    iceberg_rest_catalog_kwargs: Optional[Dict[str, Any]] = field(
+        default=None, repr=False, compare=False
+    )
+    _credentials_redacted: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self):
+        if not isinstance(self.metalake_name, str) or not self.metalake_name.strip():
+            raise ValueError("metalake_name must be a non-empty string.")
+        object.__setattr__(self, "metalake_name", self.metalake_name.strip())
+
+        for name, uri in (
+            ("gravitino_uri", self.gravitino_uri),
+            ("iceberg_rest_uri", self.iceberg_rest_uri),
+        ):
+            if not isinstance(uri, str) or not uri.strip():
+                raise ValueError(f"{name} must be a non-empty absolute HTTP(S) URI.")
+            parsed_uri = urlsplit(uri.strip())
+            if parsed_uri.scheme not in ("http", "https") or not parsed_uri.netloc:
+                raise ValueError(f"{name} must be a non-empty absolute HTTP(S) URI.")
+            if (
+                parsed_uri.username is not None
+                or parsed_uri.password is not None
+                or parsed_uri.query
+                or parsed_uri.fragment
+            ):
+                raise ValueError(
+                    f"{name} cannot embed credentials, query parameters, or fragments; "
+                    "configure authentication separately."
+                )
+
+        object.__setattr__(
+            self, "gravitino_uri", self.gravitino_uri.strip().rstrip("/")
+        )
+        object.__setattr__(
+            self, "iceberg_rest_uri", self.iceberg_rest_uri.strip().rstrip("/") + "/"
+        )
+        client_config = dict(self.client_config or {})
+        timeout_key = "gravitino_client_request_timeout"
+        if any(key != timeout_key for key in client_config):
+            raise ValueError(
+                "client_config only supports 'gravitino_client_request_timeout'."
+            )
+        if timeout_key in client_config:
+            timeout = client_config[timeout_key]
+            if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0:
+                raise ValueError(
+                    "client_config['gravitino_client_request_timeout'] must be "
+                    "a non-negative integer."
+                )
+        object.__setattr__(self, "client_config", client_config)
+        object.__setattr__(
+            self,
+            "iceberg_rest_catalog_kwargs",
+            dict(self.iceberg_rest_catalog_kwargs or {}),
+        )
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Omit authentication material from a serialized Catalog instance.
+
+        Ray resolves this catalog on the driver before creating read tasks or an
+        Iceberg datasink. Those workers receive only the resulting ``ResolvedSource``
+        or PyIceberg catalog properties. A deserialized ``GravitinoCatalog`` must
+        be reconstructed with its authentication configuration before resolving.
+        """
+        state = self.__dict__.copy()
+        has_auth_config = self.auth_data_provider is not None or bool(
+            self.iceberg_rest_catalog_kwargs
+        )
+        state["auth_data_provider"] = None
+        state["iceberg_rest_catalog_kwargs"] = {}
+        state["_credentials_redacted"] = self._credentials_redacted or has_auth_config
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
+
+    def _gravitino_client(self) -> Any:
+        if self._credentials_redacted:
+            raise RuntimeError(
+                "This GravitinoCatalog was deserialized without its authentication "
+                "configuration. Recreate it before calling resolve()."
+            )
+
+        try:
+            from gravitino.client.gravitino_client import GravitinoClient
+        except ImportError as e:
+            raise ImportError(
+                "GravitinoCatalog.resolve() requires the optional 'apache-gravitino' "
+                "package. Install it with `pip install apache-gravitino`."
+            ) from e
+
+        return GravitinoClient(
+            uri=self.gravitino_uri,
+            metalake_name=self.metalake_name,
+            auth_data_provider=self.auth_data_provider,
+            client_config=self.client_config or None,
+        )
+
+    def _load_table_metadata(
+        self,
+        catalog_name: str,
+        schema_name: str,
+        table_name: str,
+        mode: CatalogAccessMode,
+    ) -> tuple[str, Dict[str, str]]:
+        if self._credentials_redacted:
+            raise RuntimeError(
+                "This GravitinoCatalog was deserialized without its authentication "
+                "configuration. Recreate it before calling resolve()."
+            )
+
+        try:
+            from gravitino.api.authorization.privileges import Privilege
+            from gravitino.name_identifier import NameIdentifier
+        except ImportError as e:
+            raise ImportError(
+                "GravitinoCatalog.resolve() requires the optional 'apache-gravitino' "
+                "package. Install it with `pip install apache-gravitino`."
+            ) from e
+
+        client = self._gravitino_client()
+        catalog = client.load_catalog(catalog_name)
+        catalog_type = catalog.type()
+        if getattr(catalog_type, "type_name", None) != "relational":
+            raise ValueError(
+                "GravitinoCatalog supports relational Gravitino catalogs only."
+            )
+
+        required_privilege = (
+            Privilege.Name.SELECT_TABLE
+            if mode is CatalogAccessMode.READ
+            else Privilege.Name.MODIFY_TABLE
+        )
+        table = catalog.as_table_catalog().load_table(
+            NameIdentifier.of(schema_name, table_name),
+            required_privilege_names={required_privilege},
+        )
+        # Gravitino 1.3's HTTPClient creates an opener per request; its close()
+        # sends an HTTP CLOSE request and closes the caller-owned auth provider.
+        # Keep that provider reusable for subsequent Catalog.resolve() calls.
+        return catalog.provider(), dict(table.properties() or {})
+
+    @staticmethod
+    def _split_table_identifier(table: str) -> tuple[str, str, str]:
+        if not isinstance(table, str):
+            raise ValueError("table must be a three-part catalog.schema.table string.")
+        parts = table.split(".")
+        if len(parts) != 3 or any(not part.strip() for part in parts):
+            raise ValueError("table must be a three-part catalog.schema.table string.")
+        return parts[0], parts[1], parts[2]
+
+    def resolve(
+        self,
+        table: str,
+        *,
+        reader: ReaderFormat,
+        mode: CatalogAccessMode = CatalogAccessMode.READ,
+    ) -> ResolvedSource:
+        if not isinstance(reader, ReaderFormat):
+            raise ValueError("reader must be a ReaderFormat value.")
+        if not isinstance(mode, CatalogAccessMode):
+            raise ValueError("mode must be a CatalogAccessMode value.")
+        if reader not in (
+            ReaderFormat.ICEBERG,
+            ReaderFormat.DELTA,
+        ):
+            raise ValueError(
+                f"GravitinoCatalog does not support format={reader.value!r}."
+            )
+
+        if reader is ReaderFormat.DELTA and mode is CatalogAccessMode.WRITE:
+            raise ValueError(
+                "Delta writes through GravitinoCatalog are not supported because "
+                "Gravitino 1.3.0 does not support ALTER for external Delta tables, "
+                "so table metadata consistency cannot be guaranteed after a write."
+            )
+
+        catalog_name, schema_name, table_name = self._split_table_identifier(table)
+
+        provider, properties = self._load_table_metadata(
+            catalog_name, schema_name, table_name, mode
+        )
+
+        if reader is ReaderFormat.ICEBERG:
+            if provider != "lakehouse-iceberg":
+                raise ValueError(
+                    "Iceberg access requires a Gravitino 'lakehouse-iceberg' catalog."
+                )
+
+            catalog_kwargs = dict(self.iceberg_rest_catalog_kwargs or {})
+            catalog_kwargs.update(
+                {
+                    "type": "rest",
+                    "uri": self.iceberg_rest_uri,
+                    "warehouse": catalog_name,
+                }
+            )
+            catalog_kwargs.setdefault(
+                "header.X-Iceberg-Access-Delegation", "vended-credentials"
+            )
+            return ResolvedSource(
+                catalog_kwargs=catalog_kwargs,
+                table_identifier=f"{schema_name}.{table_name}",
+                data_format=ReaderFormat.ICEBERG,
+            )
+
+        if reader is ReaderFormat.DELTA:
+            if provider != "lakehouse-generic":
+                raise ValueError(
+                    "Delta access requires a Gravitino 'lakehouse-generic' catalog."
+                )
+            if (properties.get("format") or "").strip().lower() != "delta":
+                raise ValueError(
+                    "Gravitino table metadata must declare format='delta'."
+                )
+            if (properties.get("external") or "").strip().lower() != "true":
+                raise ValueError(
+                    "Gravitino Delta tables must be registered with external='true'."
+                )
+        location = properties.get("location")
+        if not isinstance(location, str) or not location.strip():
+            raise ValueError(
+                "Gravitino Delta table metadata must include a table-level location."
+            )
+
+        return ResolvedSource(path=location, data_format=reader)
