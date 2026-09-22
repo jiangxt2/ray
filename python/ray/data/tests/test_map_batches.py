@@ -802,6 +802,48 @@ def test_map_batches_async_generator_fast_yield(
     assert len(output) == len(expected_output), (len(output), len(expected_output))
 
 
+def test_map_batches_async_generator_many_output_batches(
+    shutdown_only,
+    restore_data_context,
+    target_max_block_size_infinite_or_default,
+):
+    ray.shutdown()
+    ray.init(num_cpus=3, include_dashboard=False)
+    data_context = DataContext.get_current()
+    data_context.target_max_block_size = 64 * 1024
+    data_context.execution_options.preserve_order = True
+
+    class AsyncActor:
+        async def __call__(self, batch):
+            for value in batch["id"]:
+                for output_id in range(16):
+                    yield {
+                        "id": np.array([value]),
+                        "output_id": np.array([output_id]),
+                        "payload": np.full((1, 32 * 1024), output_id, dtype=np.uint8),
+                    }
+
+    def slow_drop_payload(batch):
+        time.sleep(0.002)
+        return {"id": batch["id"], "output_id": batch["output_id"]}
+
+    ds = (
+        ray.data.range(2, override_num_blocks=1)
+        .map_batches(
+            AsyncActor,
+            batch_size=None,
+            batch_format="numpy",
+            concurrency=1,
+        )
+        .map_batches(slow_drop_payload, batch_format="numpy")
+    )
+
+    rows = ds.take_all()
+    assert [(row["id"], row["output_id"]) for row in rows] == [
+        (input_id, output_id) for input_id in range(2) for output_id in range(16)
+    ]
+
+
 @pytest.mark.skipif(
     get_pyarrow_version() < MIN_PYARROW_VERSION_TYPE_PROMOTION,
     reason="Requires PyArrow >= 14.0.0 for type promotion in nested struct fields",

@@ -1367,6 +1367,134 @@ class TestGenerateTransformFnForAsyncMap:
 
         assert list(transform_fn(input_seq, task_context)) == expected
 
+    @pytest.mark.parametrize("num_outputs", [10, 100])
+    def test_async_generator_output_is_bounded(
+        self,
+        num_outputs: int,
+        mock_actor_async_ctx,
+        target_max_block_size_infinite_or_default,
+    ):
+        max_concurrency = 3
+        input_count = 8
+        counters = {
+            "active": 0,
+            "max_active": 0,
+            "produced": 0,
+            "consumed": 0,
+            "max_pending": 0,
+        }
+        counters_lock = threading.Lock()
+
+        async def multi_yield_fn(input_id):
+            with counters_lock:
+                counters["active"] += 1
+                counters["max_active"] = max(counters["max_active"], counters["active"])
+            try:
+                for output_id in range(num_outputs):
+                    with counters_lock:
+                        counters["produced"] += 1
+                        counters["max_pending"] = max(
+                            counters["max_pending"],
+                            counters["produced"] - counters["consumed"],
+                        )
+                    yield (input_id, output_id)
+                    await asyncio.sleep(0)
+            finally:
+                with counters_lock:
+                    counters["active"] -= 1
+
+        def validate_fn(output):
+            with counters_lock:
+                counters["consumed"] += 1
+                counters["max_pending"] = max(
+                    counters["max_pending"],
+                    counters["produced"] - counters["consumed"],
+                )
+
+        transform_fn = _generate_transform_fn_for_async_map(
+            multi_yield_fn,
+            validate_fn,
+            max_concurrency=max_concurrency,
+        )
+
+        results = []
+        for output in transform_fn(range(input_count), Mock()):
+            results.append(output)
+            # Let async producers run ahead of the synchronous consumer.
+            time.sleep(0.001)
+
+        assert results == [
+            (input_id, output_id)
+            for input_id in range(input_count)
+            for output_id in range(num_outputs)
+        ]
+        assert counters["max_active"] == max_concurrency
+        assert counters["max_pending"] <= 2 * max_concurrency + 3
+        assert counters["active"] == 0
+        assert counters["produced"] == counters["consumed"]
+
+    def test_async_generator_self_cancellation_propagates(
+        self, mock_actor_async_ctx, target_max_block_size_infinite_or_default
+    ):
+        async def self_cancel_fn(item):
+            yield item
+            raise asyncio.CancelledError("cancelled by UDF")
+
+        transform_fn = _generate_transform_fn_for_async_map(
+            self_cancel_fn, Mock(), max_concurrency=1
+        )
+
+        with pytest.raises(RuntimeError, match="cancelled unexpectedly") as exc_info:
+            list(transform_fn([1], Mock()))
+
+        assert isinstance(exc_info.value.__cause__, asyncio.CancelledError)
+
+    def test_closing_async_generator_transform_cancels_producer(
+        self, mock_actor_async_ctx, target_max_block_size_infinite_or_default
+    ):
+        producer_finished = threading.Event()
+
+        async def multi_yield_fn(item):
+            try:
+                while True:
+                    yield item
+                    await asyncio.sleep(0)
+            finally:
+                producer_finished.set()
+
+        transform_fn = _generate_transform_fn_for_async_map(
+            multi_yield_fn, Mock(), max_concurrency=1
+        )
+        outputs = iter(transform_fn([1, 2], Mock()))
+
+        assert next(outputs) == 1
+        outputs.close()
+
+        assert producer_finished.wait(timeout=5)
+
+    def test_async_flat_map_coroutine_iterates_result_on_consumer_thread(
+        self, mock_actor_async_ctx, target_max_block_size_infinite_or_default
+    ):
+        iterator_thread_ids = []
+
+        async def async_flat_map_fn(item):
+            def outputs():
+                iterator_thread_ids.append(threading.get_ident())
+                yield {"id": item}
+
+            return outputs()
+
+        transform_fn = _generate_transform_fn_for_async_map(
+            async_flat_map_fn,
+            lambda _: None,
+            max_concurrency=2,
+            is_flat_map=True,
+        )
+        consumer_thread_id = threading.get_ident()
+
+        assert list(transform_fn([1, 2], Mock())) == [{"id": 1}, {"id": 2}]
+        assert iterator_thread_ids == [consumer_thread_id, consumer_thread_id]
+
     def test_concurrency_limiting(
         self,
         mock_actor_async_ctx,

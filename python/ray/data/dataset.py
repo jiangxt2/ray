@@ -722,6 +722,12 @@ class Dataset:
 
             If your function returns large objects, yield outputs in chunks.
 
+            Async generator UDFs must be callable classes with an async __call__
+            method. Ray Data forwards their yielded batches incrementally to downstream
+            processing and applies normal output block shaping. This bounds buffering
+            across in-flight work, but does not impose a hard byte limit on one yielded
+            batch or on memory allocated inside the UDF.
+
             .. testcode::
 
                 from typing import Dict
