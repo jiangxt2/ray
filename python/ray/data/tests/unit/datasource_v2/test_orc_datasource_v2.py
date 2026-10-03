@@ -193,6 +193,18 @@ def test_read_orc_routes_to_v1_when_v2_is_disabled(monkeypatch, tmp_path):
     assert captured["kwargs"]["override_num_blocks"] == 3
 
 
+def test_create_scanner_passes_target_block_size(tmp_path, monkeypatch):
+    from ray.data.context import DataContext
+
+    monkeypatch.setattr(DataContext.get_current(), "target_max_block_size", 4096)
+    datasource = OrcDatasourceV2([str(tmp_path)])
+    scanner = datasource.create_scanner(pa.schema([("id", pa.int64())]))
+    assert scanner.target_block_size == 4096
+    reader = scanner.create_reader()
+    assert reader._target_block_size == 4096
+    assert reader._explicit_batch_size is None
+
+
 if __name__ == "__main__":
     import sys
 

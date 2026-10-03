@@ -406,6 +406,32 @@ def test_orc_write_rejects_non_positive_min_rows_per_file(
         ray.data.range(1).write_orc(tmp_path, min_rows_per_file=min_rows_per_file)
 
 
+@pytest.mark.parametrize("width", [8, 4096])
+def test_read_orc_v2_adaptive_batch_sizing(
+    ray_start_regular_shared, tmp_path, monkeypatch, width
+):
+    from ray.data.context import DataContext
+    from ray.data.expressions import col
+
+    ctx = DataContext.get_current()
+    monkeypatch.setattr(ctx, "use_datasource_v2", True)
+    monkeypatch.setattr(ctx, "target_min_block_size", 1024)
+    monkeypatch.setattr(ctx, "target_max_block_size", 8192)
+    path = str(tmp_path / "data.orc")
+    _write_orc(path, pa.table({"id": range(100), "payload": ["x" * width] * 100}))
+
+    ds = ray.data.read_orc(path, include_paths=True, override_num_blocks=1)
+    assert ds._logical_plan.dag.scanner.target_block_size == 8192
+    rows = (
+        ds.filter(expr=col("id") >= 5)
+        .select_columns(["id", "path"])
+        .limit(10)
+        .take_all()
+    )
+    assert sorted(row["id"] for row in rows) == list(range(5, 15))
+    assert all(row["path"] == path for row in rows)
+
+
 if __name__ == "__main__":
     import sys
 

@@ -1,5 +1,6 @@
 """Unit tests for DSV2 ORC scanning and file reading."""
 
+import math
 from pathlib import Path
 
 import pyarrow as pa
@@ -7,7 +8,10 @@ import pytest
 from pyarrow import orc
 
 from ray.data._internal.arrow_block import _BATCH_SIZE_PRESERVING_STUB_COL_NAME
-from ray.data._internal.datasource_v2.common.file_reader import FileFormat
+from ray.data._internal.datasource_v2.common.file_reader import (
+    _ARROW_DEFAULT_BATCH_SIZE,
+    FileFormat,
+)
 from ray.data._internal.datasource_v2.common.synthesized_columns import PathColumn
 from ray.data._internal.datasource_v2.formats.orc.orc_file_reader import OrcFileReader
 from ray.data._internal.datasource_v2.formats.orc.orc_scanner import OrcScanner
@@ -279,6 +283,168 @@ def test_orc_reader_uses_synthesized_type_when_replacing_file_column(tmp_path):
     assert result.schema.field("path").type == pa.string()
     assert result.column("path").to_pylist() == [str(path), str(path)]
     assert result.column("value").to_pylist() == ["a", "b"]
+
+
+@pytest.mark.parametrize("width", [8, 512, 4096])
+def test_orc_adaptive_batches_account_for_row_width(tmp_path, width):
+    path = tmp_path / "wide.orc"
+    expected = pa.table({"id": range(2048), "payload": ["x" * width] * 2048})
+    _write_orc(path, expected)
+    reader = OrcScanner(schema=expected.schema, target_block_size=4096).create_reader()
+
+    batches = list(reader.read(_manifest(path)))
+
+    row_size = expected.nbytes / expected.num_rows
+    assert all(
+        batch.num_rows <= max(1, math.ceil(4096 / row_size)) for batch in batches
+    )
+    assert pa.concat_tables(batches).equals(expected)
+
+
+def test_orc_explicit_batch_size_takes_priority(tmp_path, monkeypatch):
+    path = tmp_path / "data.orc"
+    expected = pa.table({"id": range(50), "payload": ["x" * 1024] * 50})
+    _write_orc(path, expected)
+    reader = OrcScanner(
+        schema=expected.schema, batch_size=17, target_block_size=1
+    ).create_reader()
+
+    def unexpected_sample(_):
+        raise AssertionError("An explicit batch size must not sample data")
+
+    monkeypatch.setattr(reader, "_estimate_batch_size", unexpected_sample)
+    batches = list(reader.read(_manifest(path)))
+    assert [batch.num_rows for batch in batches] == [17, 17, 16]
+    assert pa.concat_tables(batches).equals(expected)
+
+
+def test_orc_batch_size_feedback_is_used_on_subsequent_reads(tmp_path, monkeypatch):
+    path = tmp_path / "data.orc"
+    table = pa.table({"id": range(20)})
+    _write_orc(path, table)
+    reader = OrcFileReader(target_block_size=80)
+    assert sum(batch.num_rows for batch in reader.read(_manifest(path))) == 20
+
+    reader._on_batch_read(pa.table({"payload": ["x" * 100]}))
+    monkeypatch.setattr(
+        reader, "_estimate_batch_size", lambda _: pytest.fail("resampled")
+    )
+    batches = list(reader.read(_manifest(path)))
+    assert all(batch.num_rows == 1 for batch in batches)
+
+
+def test_orc_adaptive_size_ignores_empty_feedback(tmp_path):
+    path = tmp_path / "empty.orc"
+    table = pa.table({"id": pa.array([], type=pa.int64())})
+    _write_orc(path, table)
+    reader = OrcFileReader(target_block_size=1)
+    assert list(reader.read(_manifest(path))) == []
+    assert reader._sampled_batch_size == _ARROW_DEFAULT_BATCH_SIZE
+    reader._on_batch_read(table)
+    reader._on_batch_read(pa.table({"id": pa.nulls(10)}))
+    assert reader._sampled_batch_size == _ARROW_DEFAULT_BATCH_SIZE
+
+
+def test_orc_adaptive_size_samples_only_projected_columns(tmp_path):
+    path = tmp_path / "data.orc"
+    table = pa.table({"id": range(200), "payload": ["x" * 4096] * 200})
+    _write_orc(path, table)
+    scanner = OrcScanner(schema=table.schema, target_block_size=80).prune_columns(
+        ["id"]
+    )
+    batches = list(scanner.create_reader().read(_manifest(path)))
+    assert [batch.num_rows for batch in batches] == [10] * 20
+    assert pa.concat_tables(batches).equals(table.select(["id"]))
+
+
+@pytest.mark.parametrize("columns", [[], ["path"]])
+def test_orc_adaptive_size_handles_synthesized_only_projection(tmp_path, columns):
+    path = tmp_path / "data.orc"
+    table = pa.table({"id": range(7)})
+    _write_orc(path, table)
+    scanner = OrcScanner(
+        schema=table.schema,
+        synthesized_columns=(PathColumn(),),
+        target_block_size=1,
+    ).prune_columns(columns)
+    batches = list(scanner.create_reader().read(_manifest(path)))
+    assert sum(batch.num_rows for batch in batches) == 7
+    if columns:
+        assert pa.concat_tables(batches).column("path").to_pylist() == [str(path)] * 7
+
+
+def test_orc_adaptive_size_caps_infinite_target(tmp_path):
+    import sys
+
+    path = tmp_path / "data.orc"
+    table = pa.table({"id": range(10)})
+    _write_orc(path, table)
+    reader = OrcFileReader(target_block_size=sys.maxsize)
+    assert sum(batch.num_rows for batch in reader.read(_manifest(path))) == 10
+    assert reader._sampled_batch_size == _ARROW_DEFAULT_BATCH_SIZE
+
+
+def test_orc_adaptive_sampling_is_bounded_and_closes_reader():
+    table = pa.table({"id": range(4)})
+    calls = []
+
+    class SampleReader:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            assert not calls
+            calls.append("batch")
+            return table.to_batches()[0]
+
+        def close(self):
+            calls.append("closed")
+
+    class Scanner:
+        def to_reader(self):
+            return SampleReader()
+
+    class Dataset:
+        schema = table.schema
+
+        def scanner(self, **kwargs):
+            assert kwargs == {
+                "columns": ["id"],
+                "batch_size": 1024,
+                "batch_readahead": 0,
+                "fragment_readahead": 0,
+            }
+            return Scanner()
+
+    reader = OrcFileReader(
+        target_block_size=80, columns=["id", "path"], predicate=col("id") < 0
+    )
+    assert reader._estimate_batch_size(Dataset()) == 10
+    assert calls == ["batch", "closed"]
+
+
+def test_orc_adaptive_sampling_retries_transient_io(tmp_path, monkeypatch):
+    from ray.data.context import DataContext
+
+    path = tmp_path / "data.orc"
+    _write_orc(path, pa.table({"id": range(10)}))
+    reader = OrcFileReader(target_block_size=80)
+    calls = []
+    backoffs = []
+
+    def estimate(_):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError("temporary sample failure")
+        return 2
+
+    monkeypatch.setattr(DataContext.get_current(), "retried_io_errors", ["temporary"])
+    monkeypatch.setattr("ray._common.retry.time.sleep", backoffs.append)
+    monkeypatch.setattr(reader, "_estimate_batch_size", estimate)
+    batches = list(reader.read(_manifest(path)))
+    assert len(calls) == 2
+    assert len(backoffs) == 1
+    assert [batch.num_rows for batch in batches] == [2] * 5
 
 
 if __name__ == "__main__":
