@@ -48,13 +48,7 @@ class ParquetScanner(ArrowFileScanner):
         here would put the schema out of sync with the actual blocks — so
         only append when no projection is active or when it survives.
         """
-        schema = super().read_schema()
-        for column in self.synthesized_columns:
-            if self.columns is not None and column.name not in self.columns:
-                continue
-            if schema.get_field_index(column.name) != -1:
-                continue
-            schema = schema.append(pa.field(column.name, column.type))
+        schema = self._read_schema_with_synthesized_columns(self.synthesized_columns)
 
         check_for_legacy_tensor_type(schema)
         return schema

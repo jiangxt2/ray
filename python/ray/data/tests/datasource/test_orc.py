@@ -406,6 +406,32 @@ def test_orc_write_rejects_non_positive_min_rows_per_file(
         ray.data.range(1).write_orc(tmp_path, min_rows_per_file=min_rows_per_file)
 
 
+@pytest.mark.parametrize("file_format", ["orc", "parquet"])
+def test_shared_arrow_schema_public_api_projection(
+    ray_start_regular_shared, tmp_path, monkeypatch, file_format
+):
+    import pyarrow.parquet as parquet
+
+    from ray.data.context import DataContext
+    from ray.data.expressions import col
+
+    monkeypatch.setattr(DataContext.get_current(), "use_datasource_v2", True)
+    path = str(tmp_path / f"data.{file_format}")
+    table = pa.table({"id": range(20), "value": ["x"] * 20})
+    if file_format == "orc":
+        _write_orc(path, table)
+        ds = ray.data.read_orc(path, include_paths=True)
+    else:
+        parquet.write_table(table, path)
+        ds = ray.data.read_parquet(path, include_paths=True)
+    projected = ds.filter(expr=col("id") >= 5).select_columns(["path", "id"])
+    assert projected.schema().names == ["path", "id"]
+    rows = projected.take_all()
+    assert sorted(row["id"] for row in rows) == list(range(5, 20))
+    assert all(row["path"] == path for row in rows)
+    assert ds.select_columns([]).count() == 20
+
+
 if __name__ == "__main__":
     import sys
 

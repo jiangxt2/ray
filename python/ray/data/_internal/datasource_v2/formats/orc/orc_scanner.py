@@ -26,34 +26,9 @@ class OrcScanner(ArrowFileScanner):
 
     def read_schema(self) -> pa.Schema:
         """Return the projected schema including synthesized columns."""
-        synthesized_by_name = {
-            column.name: column for column in self.synthesized_columns
-        }
-
-        if self.columns is None:
-            schema = self.schema
-            for column in self.synthesized_columns:
-                field = pa.field(column.name, column.type)
-                index = schema.get_field_index(column.name)
-                if index == -1:
-                    schema = schema.append(field)
-                elif schema.field(index).type != column.type:
-                    schema = schema.set(index, field)
-            return schema
-
-        fields = []
-        for name in self.columns:
-            column = synthesized_by_name.get(name)
-            if column is not None:
-                # The reader replaces any same-named on-disk field, so the
-                # logical schema must advertise the synthesized type too.
-                fields.append(pa.field(name, column.type))
-                continue
-
-            index = self.schema.get_field_index(name)
-            assert index >= 0, f"Column {name} not found in schema"
-            fields.append(self.schema.field(index))
-        return pa.schema(fields)
+        return self._read_schema_with_synthesized_columns(
+            self.synthesized_columns, replace_existing=True
+        )
 
     def create_reader(self) -> OrcFileReader:
         """Create a reader with this scanner's projection and filters."""

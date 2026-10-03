@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 from pyarrow.fs import FileSystem
@@ -10,6 +10,9 @@ from ray.data._internal.datasource_v2.interfaces.pushdown import (
     SupportsColumnPruning,
     SupportsFilterPushdown,
     SupportsLimitPushdown,
+)
+from ray.data._internal.datasource_v2.interfaces.synthesized_columns import (
+    SynthesizedColumn,
 )
 from ray.data.expressions import Expr
 from ray.util.annotations import DeveloperAPI
@@ -71,14 +74,43 @@ class ArrowFileScanner(
         survive a zero-column scan; that stub is an execution-layer detail
         and is deliberately not reflected in this logical schema.
         """
+        return self._project_schema(self.schema)
+
+    def _project_schema(self, schema: pa.Schema) -> pa.Schema:
         if self.columns is None:
-            return self.schema
+            return schema
         fields = []
         for name in self.columns:
-            idx = self.schema.get_field_index(name)
+            idx = schema.get_field_index(name)
             assert idx >= 0, f"Column {name} not found in schema"
-            fields.append(self.schema.field(idx))
+            fields.append(schema.field(idx))
         return pa.schema(fields)
+
+    def _read_schema_with_synthesized_columns(
+        self,
+        synthesized_columns: Sequence[SynthesizedColumn],
+        *,
+        replace_existing: bool = False,
+    ) -> pa.Schema:
+        """Add synthesized fields while preserving each format's schema policy.
+
+        Parquet projects the datasource-provided schema before adding missing
+        fields. ORC also normalizes same-named fields to the synthesized type,
+        and permits projecting a synthesized field absent from that schema.
+        """
+        schema = self.schema if replace_existing else self._project_schema(self.schema)
+        for column in synthesized_columns:
+            if self.columns is not None and column.name not in self.columns:
+                continue
+            field = pa.field(column.name, column.type)
+            index = schema.get_field_index(column.name)
+            if index == -1:
+                schema = schema.append(field)
+            elif replace_existing and (
+                self.columns is not None or schema.field(index).type != column.type
+            ):
+                schema = schema.set(index, field)
+        return self._project_schema(schema) if replace_existing else schema
 
     @override
     def push_filters(
