@@ -281,6 +281,73 @@ def test_orc_reader_uses_synthesized_type_when_replacing_file_column(tmp_path):
     assert result.column("value").to_pylist() == ["a", "b"]
 
 
+def test_orc_metadata_counts_files_in_manifest_order(tmp_path, monkeypatch):
+    paths = []
+    for index, count in enumerate([3, 0, 7]):
+        path = tmp_path / f"part-{index}.orc"
+        _write_orc(path, pa.table({"id": pa.array(range(count), type=pa.int64())}))
+        paths.append(path)
+
+    def unexpected_data_read(*args, **kwargs):
+        pytest.fail("Metadata counting decoded data columns")
+
+    monkeypatch.setattr(orc.ORCFile, "read", unexpected_data_read)
+    monkeypatch.setattr(orc.ORCFile, "read_stripe", unexpected_data_read)
+    reader = OrcFileReader(format=FileFormat.ORC)
+    metadata = list(reader.read_metadata(_manifest(*paths)))
+    assert [item.num_rows for item in metadata] == [3, 0, 7]
+    assert all(item.size_bytes is None for item in metadata)
+
+
+def test_orc_metadata_empty_manifest():
+    manifest = FileManifest.construct_manifest(paths=[], sizes=[], chunk_metadatas=[])
+    assert list(OrcFileReader(format=FileFormat.ORC).read_metadata(manifest)) == []
+
+
+def test_orc_metadata_declines_data_predicates():
+    from ray.data._internal.datasource_v2.interfaces.supports_metadata import (
+        MetadataType,
+    )
+
+    reader = OrcFileReader(format=FileFormat.ORC)
+    assert reader.available_metadata() == {MetadataType.NUM_ROWS}
+    assert reader.get_target_metadata_batch_size() == reader._COUNT_ROWS_BATCH_SIZE
+    reader = OrcFileReader(format=FileFormat.ORC, predicate=col("id") > 0)
+    assert reader.available_metadata() == set()
+
+
+def test_orc_metadata_rejects_corrupt_footer(tmp_path):
+    path = tmp_path / "broken.orc"
+    path.write_bytes(b"not an ORC file")
+    with pytest.raises((pa.ArrowInvalid, OSError)) as exc:
+        list(OrcFileReader(format=FileFormat.ORC).read_metadata(_manifest(path)))
+    assert str(path) in str(exc.value)
+
+
+def test_orc_metadata_retries_transient_footer_io(tmp_path, monkeypatch):
+    from ray.data.context import DataContext
+
+    path = tmp_path / "data.orc"
+    _write_orc(path, pa.table({"id": range(3)}))
+    original = orc.ORCFile
+    calls = []
+    backoffs = []
+
+    def read_footer(source):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError("temporary footer failure")
+        return original(source)
+
+    monkeypatch.setattr(DataContext.get_current(), "retried_io_errors", ["temporary"])
+    monkeypatch.setattr("ray._common.retry.time.sleep", backoffs.append)
+    monkeypatch.setattr(orc, "ORCFile", read_footer)
+    metadata = list(OrcFileReader(format=FileFormat.ORC).read_metadata(_manifest(path)))
+    assert [item.num_rows for item in metadata] == [3]
+    assert len(calls) == 2
+    assert len(backoffs) == 1
+
+
 if __name__ == "__main__":
     import sys
 

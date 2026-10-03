@@ -406,6 +406,80 @@ def test_orc_write_rejects_non_positive_min_rows_per_file(
         ray.data.range(1).write_orc(tmp_path, min_rows_per_file=min_rows_per_file)
 
 
+def _optimized_orc_count_plan(ds):
+    from ray.data._internal.logical.interfaces import LogicalPlan
+    from ray.data._internal.logical.operators.count_operator import Count
+    from ray.data._internal.logical.operators.map_operator import Project
+    from ray.data._internal.logical.optimizers import LogicalOptimizer
+
+    count = Count(
+        input_dependencies=[
+            Project(exprs=[], input_dependencies=[ds._logical_plan.dag])
+        ]
+    )
+    return LogicalOptimizer().optimize(LogicalPlan(count, ds.context)).dag
+
+
+def _walk_orc_plan(op):
+    yield op
+    for child in op.input_dependencies:
+        yield from _walk_orc_plan(child)
+
+
+@pytest.mark.parametrize("counts", [[10], [2000, 3000, 0], [0, 0]])
+@pytest.mark.parametrize("include_paths", [False, True])
+def test_read_orc_v2_counts_from_footer(
+    ray_start_regular_shared, tmp_path, monkeypatch, counts, include_paths
+):
+    from ray.data._internal.logical.operators.map_operator import MapBatches
+    from ray.data._internal.logical.operators.read_operator import ReadFiles
+    from ray.data.context import DataContext
+
+    monkeypatch.setattr(DataContext.get_current(), "use_datasource_v2", True)
+    for index, count in enumerate(counts):
+        _write_orc(
+            str(tmp_path / f"part-{index}.orc"),
+            pa.table({"id": pa.array(range(count), type=pa.int64())}),
+        )
+    ds = ray.data.read_orc(str(tmp_path), include_paths=include_paths)
+    plan = _optimized_orc_count_plan(ds)
+    assert isinstance(plan, MapBatches)
+    assert not any(isinstance(op, ReadFiles) for op in _walk_orc_plan(plan))
+    assert ds.count() == sum(counts)
+
+
+@pytest.mark.parametrize("case", ["predicate", "limit", "partition_predicate"])
+def test_read_orc_v2_footer_count_declines_row_reducing_reads(
+    ray_start_regular_shared, tmp_path, monkeypatch, case
+):
+    from ray.data._internal.logical.operators.read_operator import ReadFiles
+    from ray.data.context import DataContext
+    from ray.data.datasource.partitioning import Partitioning
+    from ray.data.expressions import col
+
+    monkeypatch.setattr(DataContext.get_current(), "use_datasource_v2", True)
+    directory = tmp_path / "year=2024"
+    directory.mkdir()
+    _write_orc(str(directory / "data.orc"), pa.table({"id": range(20)}))
+    ds = ray.data.read_orc(
+        str(tmp_path), partitioning=Partitioning("hive", base_dir=str(tmp_path))
+    )
+    if case == "predicate":
+        ds = ds.filter(expr=col("id") >= 10)
+        expected = 10
+    elif case == "limit":
+        ds = ds.limit(7)
+        expected = 7
+    else:
+        ds = ds.filter(expr=col("year") == "2024")
+        expected = 20
+    assert any(
+        isinstance(op, ReadFiles)
+        for op in _walk_orc_plan(_optimized_orc_count_plan(ds))
+    )
+    assert ds.count() == expected
+
+
 if __name__ == "__main__":
     import sys
 
