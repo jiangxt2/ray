@@ -9,19 +9,17 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Union
 import pyarrow as pa
 from typing_extensions import override
 
-from ray.data._internal.datasource_v2.common.file_reader import FileFormat
 from ray.data._internal.datasource_v2.common.non_sampling_file_indexer import (
     NonSamplingFileIndexer,
 )
 from ray.data._internal.datasource_v2.common.round_robin_partitioner import (
     RoundRobinPartitioner,
 )
-from ray.data._internal.datasource_v2.common.size_estimators import (
-    SamplingInMemorySizeEstimator,
-)
 from ray.data._internal.datasource_v2.common.synthesized_columns import PathColumn
-from ray.data._internal.datasource_v2.formats.orc.orc_file_reader import OrcFileReader
 from ray.data._internal.datasource_v2.formats.orc.orc_scanner import OrcScanner
+from ray.data._internal.datasource_v2.formats.orc.orc_size_estimator import (
+    OrcInMemorySizeEstimator,
+)
 from ray.data._internal.datasource_v2.interfaces.datasource_v2 import (
     DatasourceCategory,
     FileDataSourceV2,
@@ -104,8 +102,9 @@ class OrcDatasourceV2(FileDataSourceV2):
     ) -> Optional[FilePartitioner]:
         if hints is None:
             return None
-        reader = OrcFileReader(format=FileFormat.ORC, filesystem=self._filesystem)
-        return RoundRobinPartitioner(SamplingInMemorySizeEstimator(reader), hints=hints)
+        return RoundRobinPartitioner(
+            OrcInMemorySizeEstimator(self._filesystem), hints=hints
+        )
 
     @property
     @override

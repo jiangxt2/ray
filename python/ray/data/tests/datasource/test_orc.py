@@ -406,6 +406,34 @@ def test_orc_write_rejects_non_positive_min_rows_per_file(
         ray.data.range(1).write_orc(tmp_path, min_rows_per_file=min_rows_per_file)
 
 
+@pytest.mark.parametrize("compression", ["uncompressed", "zlib"])
+def test_read_orc_v2_with_sampled_size_estimator(
+    ray_start_regular_shared, tmp_path, monkeypatch, compression
+):
+    from ray.data._internal.datasource_v2.formats.orc.orc_size_estimator import (
+        OrcInMemorySizeEstimator,
+    )
+    from ray.data.context import DataContext
+
+    monkeypatch.setattr(DataContext.get_current(), "use_datasource_v2", True)
+    for index in range(3):
+        table = pa.table(
+            {
+                "id": range(index * 2000, (index + 1) * 2000),
+                "payload": ["x" * 256] * 2000,
+            }
+        )
+        orc.write_table(
+            table, str(tmp_path / f"part-{index}.orc"), compression=compression
+        )
+    ds = ray.data.read_orc(str(tmp_path), override_num_blocks=2)
+    partitioner = ds._logical_plan.dag.input_dependencies[0].file_partitioner
+    assert isinstance(partitioner._in_memory_size_estimator, OrcInMemorySizeEstimator)
+    rows = ds.take_all()
+    assert sorted(row["id"] for row in rows) == list(range(6000))
+    assert all(row["payload"] == "x" * 256 for row in rows)
+
+
 if __name__ == "__main__":
     import sys
 

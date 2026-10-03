@@ -193,6 +193,19 @@ def test_read_orc_routes_to_v1_when_v2_is_disabled(monkeypatch, tmp_path):
     assert captured["kwargs"]["override_num_blocks"] == 3
 
 
+def test_partitioner_uses_orc_size_estimator(tmp_path):
+    from ray.data._internal.datasource_v2.formats.orc.orc_size_estimator import (
+        OrcInMemorySizeEstimator,
+    )
+
+    datasource = OrcDatasourceV2([str(tmp_path)])
+    assert datasource.get_file_partitioner() is None
+    partitioner = datasource.get_file_partitioner(
+        hints=PartitionHints(min_bucket_size=0, max_bucket_size=1024, num_buckets=1)
+    )
+    assert isinstance(partitioner._in_memory_size_estimator, OrcInMemorySizeEstimator)
+
+
 if __name__ == "__main__":
     import sys
 
