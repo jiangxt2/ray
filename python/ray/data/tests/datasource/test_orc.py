@@ -501,6 +501,108 @@ def test_read_orc_v1_fallback_preserves_columns_outside_v2_sample(
     assert rows[-1] == {"id": 19, "extra": "late"}
 
 
+def _trace_orc_decodes(required_workers, monkeypatch):
+    import asyncio
+
+    from ray.data._internal.datasource_v2.formats.orc.orc_datasource_v2 import (
+        OrcDatasourceV2,
+    )
+    from ray.data.tests.datasource.orc_decode_trace import traced_scanner
+
+    @ray.remote(num_cpus=0)
+    class Trace:
+        def __init__(self):
+            self.records = []
+            self.workers = set()
+            self.ready = asyncio.Event()
+
+        async def record(self, stripe, worker):
+            self.records.append((stripe, worker))
+            self.workers.add(worker)
+            if len(self.workers) >= required_workers:
+                self.ready.set()
+            await asyncio.wait_for(self.ready.wait(), timeout=30)
+
+        def snapshot(self):
+            return self.records
+
+    trace = Trace.remote()
+    original = OrcDatasourceV2.create_scanner
+
+    def create_scanner(self, *args, **kwargs):
+        return traced_scanner(original(self, *args, **kwargs), trace)
+
+    monkeypatch.setattr(OrcDatasourceV2, "create_scanner", create_scanner)
+    return trace
+
+
+@pytest.mark.parametrize("preserve_order", [False, True])
+def test_read_orc_stripes_use_multiple_real_workers(
+    ray_start_regular_shared, tmp_path, monkeypatch, preserve_order
+):
+    from ray.data.context import DataContext
+
+    ctx = DataContext.get_current()
+    monkeypatch.setattr(ctx, "use_datasource_v2", True)
+    monkeypatch.setattr(ctx, "target_min_block_size", 0)
+    monkeypatch.setattr(ctx.execution_options, "preserve_order", preserve_order)
+    path = tmp_path / "stripes.orc"
+    expected = pa.table(
+        {"id": list(range(4096)), "value": [f"row-{i}" for i in range(4096)]}
+    )
+    orc.write_table(expected, str(path), stripe_size=8192)
+    stripe_count = orc.ORCFile(str(path)).nstripes
+    assert stripe_count > 1
+    trace = _trace_orc_decodes(required_workers=2, monkeypatch=monkeypatch)
+    try:
+        dataset = ray.data.read_orc(
+            str(path), override_num_blocks=2, num_cpus=0.5
+        ).materialize()
+        rows = dataset.take_all()
+        assert sorted(rows, key=lambda row: row["id"]) == expected.to_pylist()
+        if preserve_order:
+            assert rows == expected.to_pylist()
+        records = ray.get(trace.snapshot.remote())
+        assert sorted(stripe for stripe, _ in records) == list(range(stripe_count))
+        assert len({worker for _, worker in records}) >= 2
+    finally:
+        ray.kill(trace)
+
+
+def test_read_orc_statistics_skip_physical_stripes(
+    ray_start_regular_shared, tmp_path, monkeypatch
+):
+    from ray.data.context import DataContext
+    from ray.data.expressions import col
+
+    ctx = DataContext.get_current()
+    monkeypatch.setattr(ctx, "use_datasource_v2", True)
+    monkeypatch.setattr(ctx, "target_min_block_size", 0)
+    path = tmp_path / "pruned.orc"
+    expected = pa.table(
+        {"id": list(range(8192)), "value": [f"row-{i}" for i in range(8192)]}
+    )
+    orc.write_table(expected, str(path), stripe_size=8192)
+    stripe_count = orc.ORCFile(str(path)).nstripes
+    trace = _trace_orc_decodes(required_workers=1, monkeypatch=monkeypatch)
+    try:
+        rows = (
+            ray.data.read_orc(str(path), override_num_blocks=2, num_cpus=0.5)
+            .filter(expr=col("id") >= 8100)
+            .take_all()
+        )
+        assert (
+            sorted(rows, key=lambda row: row["id"]) == expected.slice(8100).to_pylist()
+        )
+        records = ray.get(trace.snapshot.remote())
+        decoded = [stripe for stripe, _ in records]
+        assert decoded
+        assert len(decoded) == len(set(decoded))
+        assert len(decoded) < stripe_count
+    finally:
+        ray.kill(trace)
+
+
 if __name__ == "__main__":
     import sys
 
