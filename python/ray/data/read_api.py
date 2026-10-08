@@ -2882,6 +2882,9 @@ def read_orc(
         The DataSourceV2 reader is selected through
         :attr:`~ray.data.context.DataContext.use_datasource_v2`.
         It samples file schemas and may omit columns absent from the sample.
+        Installing the optional `pyorc` package enables physical stripe read
+        units. PyArrow still decodes the data; each stripe is materialized before
+        producing output batches.
 
     Examples:
         Read an ORC file in remote storage or local storage.

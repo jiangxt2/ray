@@ -61,7 +61,11 @@ def test_infer_schema_unifies_files_and_hive_partitions(tmp_path):
     assert schema.field("path").type == pa.string()
 
 
-def test_resolve_partitioning_and_reuse_generic_file_components(tmp_path):
+def test_resolve_partitioning_and_reuse_generic_file_components(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "ray.data._internal.datasource_v2.formats.orc.orc_datasource_v2.pyorc_available",
+        lambda: False,
+    )
     partition_dir = tmp_path / "year=2024"
     partition_dir.mkdir()
     file_path = partition_dir / "data.orc"

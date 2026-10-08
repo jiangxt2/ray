@@ -21,7 +21,12 @@ from ray.data._internal.datasource_v2.common.size_estimators import (
 )
 from ray.data._internal.datasource_v2.common.synthesized_columns import PathColumn
 from ray.data._internal.datasource_v2.formats.orc.orc_file_reader import OrcFileReader
+from ray.data._internal.datasource_v2.formats.orc.orc_metadata import pyorc_available
 from ray.data._internal.datasource_v2.formats.orc.orc_scanner import OrcScanner
+from ray.data._internal.datasource_v2.formats.orc.orc_stripe_indexer import (
+    OrcStripeIndexer,
+    OrcStripePartitioner,
+)
 from ray.data._internal.datasource_v2.interfaces.datasource_v2 import (
     DatasourceCategory,
     FileDataSourceV2,
@@ -96,6 +101,8 @@ class OrcDatasourceV2(FileDataSourceV2):
 
     @override
     def _get_file_indexer(self) -> FileIndexer:
+        if pyorc_available():
+            return OrcStripeIndexer(ignore_missing_paths=self._ignore_missing_paths)
         return NonSamplingFileIndexer(ignore_missing_paths=self._ignore_missing_paths)
 
     @override
@@ -104,6 +111,8 @@ class OrcDatasourceV2(FileDataSourceV2):
     ) -> Optional[FilePartitioner]:
         if hints is None:
             return None
+        if pyorc_available():
+            return OrcStripePartitioner(hints)
         reader = OrcFileReader(format=FileFormat.ORC, filesystem=self._filesystem)
         return RoundRobinPartitioner(SamplingInMemorySizeEstimator(reader), hints=hints)
 
@@ -117,7 +126,7 @@ class OrcDatasourceV2(FileDataSourceV2):
         import pyarrow.orc as orc
 
         assert sample is not None
-        sample_paths = sample.paths.tolist()
+        sample_paths: List[str] = sample.paths.tolist()
         filesystem = self._filesystem
 
         def _read_schema(path: str) -> pa.Schema:
