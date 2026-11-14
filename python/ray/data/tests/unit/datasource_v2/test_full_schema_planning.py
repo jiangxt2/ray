@@ -105,6 +105,51 @@ def test_schema_task_admission(case_args, allowed):
 
 
 @pytest.mark.parametrize(
+    "module,source_type",
+    [
+        (parquet_datasource_v2, parquet_datasource_v2.ParquetDatasourceV2),
+        (orc_datasource_v2, orc_datasource_v2.OrcDatasourceV2),
+    ],
+)
+def test_full_schema_preserves_subclass_schema_hook(monkeypatch, module, source_type):
+    for suffix, value in dict(
+        min_files=0, max_tasks=2, num_cpus=0.5, batch_size=2, io_concurrency=4
+    ).items():
+        monkeypatch.setattr(
+            inference, f"_FULL_SCHEMA_INFERENCE_{suffix.upper()}", value
+        )
+    monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 4})
+    monkeypatch.setattr(
+        DataContext.get_current().execution_options, "label_selector", None
+    )
+    remote = Mock()
+    remote.options.return_value = remote
+    remote.remote.side_effect = RuntimeError("distributed path selected")
+    monkeypatch.setattr(inference, "cached_remote_fn", Mock(return_value=remote))
+    distributed = Mock(wraps=module.infer_full_schema_from_files)
+    monkeypatch.setattr(module, "infer_full_schema_from_files", distributed)
+    sample = FileManifest.construct_manifest(
+        paths=["unused"], sizes=[1], chunk_metadatas=[None]
+    )
+    custom_schema = pa.schema([("custom", pa.int64())])
+    hook = Mock(return_value=custom_schema)
+    custom_type = type("CustomSource", (source_type,), {"infer_schema": hook})
+    source = custom_type(["unused"], filesystem=pafs.LocalFileSystem())
+
+    assert source.infer_full_schema(sample, ray_remote_args={}) is custom_schema
+    hook.assert_called_once_with(sample)
+    distributed.assert_not_called()
+    remote.remote.assert_not_called()
+
+    inherited_type = type("InheritedSource", (source_type,), {})
+    inherited = inherited_type(["unused"], filesystem=pafs.LocalFileSystem())
+    with pytest.raises(RuntimeError, match="distributed path selected"):
+        inherited.infer_full_schema(sample, ray_remote_args={})
+    distributed.assert_called_once()
+    remote.remote.assert_called_once()
+
+
+@pytest.mark.parametrize(
     "read_args,cpus,io_concurrency,threshold,window,schema_case",
     [
         ({}, 4, 4, 0, 0, "unique"),

@@ -341,7 +341,11 @@ class ParquetDatasourceV2(FileDataSourceV2):
     def infer_full_schema(
         self, sample: FileManifest, *, ray_remote_args: Dict[str, Any]
     ) -> pa.Schema:
-        if self._user_schema is not None or not len(sample):
+        if (
+            type(self).infer_schema is not ParquetDatasourceV2.infer_schema
+            or self._user_schema is not None
+            or not len(sample)
+        ):
             return self.infer_schema(sample)
         schema = infer_full_schema_from_files(
             sample,
