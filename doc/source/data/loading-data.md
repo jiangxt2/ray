@@ -963,7 +963,7 @@ dataset = ray.data.read_hive(
 (read-hive-auth-tls)=
 #### Configure TLS certificate verification
 
-Configure verified TLS inside `connection_factory` and make the trusted CA file available wherever the factory runs. The host name must match the server certificate. For GSSAPI, install `impyla[kerberos]` and provide the required credentials wherever the factory runs; the TLS validation described here doesn't cover GSSAPI.
+Configure verified TLS inside `connection_factory` and make the trusted CA file available wherever the factory runs. The host name must match the server certificate. For GSSAPI, install `impyla[kerberos]`, set `kerberos_service_name` to the service component of the server principal (for example, `"hive"` for `hive/host@REALM`), and provide the required credentials wherever the factory runs; the TLS validation described here doesn't cover GSSAPI.
 
 ```python
 def create_tls_connection():
