@@ -194,6 +194,24 @@ ds.show(3)
 
 :::::
 
+### Read registered external Delta tables
+
+Use {class}`~ray.data.GravitinoCatalog` with {func}`~ray.data.read_delta` to read an existing external Delta table registered in a generic lakehouse catalog. Install `deltalake` to use the Delta reader.
+
+```python
+import os
+import ray
+
+catalog = ray.data.GravitinoCatalog(
+    uri="https://gravitino.example.com",
+    metalake="lakehouse",
+    main_api_headers={"Authorization": os.environ["GRAVITINO_AUTHORIZATION"]},
+)
+ds = ray.data.read_delta("catalog_name.schema_name.table_name", catalog=catalog)
+```
+
+The main API header authenticates the metadata lookup. Configure separate storage access for the Delta log and for data files read by Ray workers, using `storage_options`, `filesystem`, or the storage providers' environment as appropriate. Metadata access doesn't grant access to the files. The catalog doesn't provide Delta storage credentials, token refresh, or Delta writes. The header can be present in serialized catalog objects.
+
 (reading-files-from-shared-local-storage)=
 
 ### Read files from shared local storage

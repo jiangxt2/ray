@@ -1,15 +1,17 @@
-"""Tests for the Gravitino Iceberg Catalog adapter."""
+"""Tests for the Gravitino Catalog adapter."""
 
 import base64
 import builtins
 import json
 import pickle
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest import mock
 
 import pytest
+import requests
 
 import ray
 import ray.cloudpickle as cloudpickle
@@ -145,7 +147,7 @@ def test_iceberg_requires_explicit_rest_uri():
         catalog.resolve("cat.db.tbl", reader=ReaderFormat.ICEBERG)
 
 
-@pytest.mark.parametrize("reader", [ReaderFormat.DELTA, ReaderFormat.PARQUET])
+@pytest.mark.parametrize("reader", [ReaderFormat.PARQUET])
 def test_deferred_formats_rejected(catalog, reader):
     with pytest.raises(ValueError, match="does not support format"):
         catalog.resolve("cat.db.tbl", reader=reader)
@@ -430,6 +432,233 @@ def test_actual_pyiceberg_auth_configuration(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_delta_actual_http_resolution(tmp_path, monkeypatch):
+    """Exercise URL encoding, protocol headers, and explicit auth over HTTP."""
+    observed = []
+    metadata = {"format": "delta", "external": "true", "location": "s3://bucket/table/"}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            observed.append(
+                (
+                    self.path,
+                    self.headers.get("Accept"),
+                    self.headers.get("Authorization"),
+                )
+            )
+            if self.path.endswith("/tables/orders%20%23"):
+                result = {"code": 0, "table": {"properties": metadata}}
+            else:
+                result = {"code": 0, "catalog": {"provider": "lakehouse-generic"}}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        netrc = tmp_path / "netrc"
+        netrc.write_text("machine 127.0.0.1 login wrong password wrong\n")
+        netrc.chmod(0o600)
+        monkeypatch.setenv("NETRC", str(netrc))
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        headers = {"Authorization": "Bearer header-secret", "accept": "incorrect"}
+        catalog = GravitinoCatalog(
+            uri=f"http://127.0.0.1:{server.server_port}/prefix/",
+            metalake="lake /",
+            main_api_headers=headers,
+        )
+        headers["Authorization"] = "modified"
+        result = catalog.resolve("cat.db.orders #", reader=ReaderFormat.DELTA)
+        assert result.path == metadata["location"]
+        assert result.data_format == ReaderFormat.DELTA
+        assert result.storage_options is None and result.filesystem is None
+        prefix = "/prefix/api/metalakes/lake%20%2F/catalogs/cat"
+        assert observed == [
+            (prefix, "application/vnd.gravitino.v1+json", "Bearer header-secret"),
+            (
+                prefix + "/schemas/db/tables/orders%20%23",
+                "application/vnd.gravitino.v1+json",
+                "Bearer header-secret",
+            ),
+        ]
+        assert "header-secret" not in repr(catalog)
+        for serializer in (pickle, cloudpickle):
+            assert (
+                serializer.loads(serializer.dumps(catalog)).main_api_headers
+                == catalog.main_api_headers
+            )
+        observed.clear()
+        anonymous = GravitinoCatalog(
+            uri=f"http://127.0.0.1:{server.server_port}/prefix/", metalake="lake /"
+        )
+        anonymous.resolve("cat.db.orders #", reader=ReaderFormat.DELTA)
+        assert [request[2] for request in observed] == [None, None]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_delta_write_rejected_before_network(catalog):
+    with mock.patch("requests.Session", side_effect=AssertionError("network")):
+        with pytest.raises(ValueError, match="Delta writes"):
+            catalog.resolve(
+                "cat.db.tbl", reader=ReaderFormat.DELTA, mode=CatalogAccessMode.WRITE
+            )
+
+
+@pytest.mark.parametrize(
+    "metadata, message",
+    [
+        ({"format": "iceberg", "external": "true", "location": "s3://b/t"}, "format"),
+        ({"format": "delta", "external": "false", "location": "s3://b/t"}, "external"),
+        ({"format": "delta", "external": "true", "location": " "}, "location"),
+        (None, "properties"),
+    ],
+)
+def test_delta_invalid_metadata(catalog, metadata, message):
+    responses = [
+        {"code": 0, "catalog": {"provider": "lakehouse-generic"}},
+        {"code": 0, "table": {"properties": metadata}},
+    ]
+    with mock.patch.object(GravitinoCatalog, "_get_main_api", side_effect=responses):
+        with pytest.raises(ValueError, match=message):
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+
+
+@pytest.mark.parametrize("provider", [None, "lakehouse-iceberg"])
+def test_delta_wrong_catalog_rejected(catalog, provider):
+    with mock.patch.object(
+        GravitinoCatalog,
+        "_get_main_api",
+        return_value={"code": 0, "catalog": {"provider": provider}},
+    ) as request:
+        with pytest.raises(ValueError, match="lakehouse-generic"):
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+        assert request.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "status, error",
+    [
+        (401, PermissionError),
+        (403, PermissionError),
+        (404, FileNotFoundError),
+        (302, RuntimeError),
+        (500, RuntimeError),
+    ],
+)
+def test_delta_http_status(catalog, status, error):
+    with mock.patch("requests.Session") as session:
+        response = session.return_value.__enter__.return_value.get.return_value
+        response.status_code = status
+        with pytest.raises(error):
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+        assert response.json.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "failure, expected",
+    [
+        (requests.Timeout("secret"), TimeoutError),
+        (requests.ConnectionError("Read timed out: secret"), RuntimeError),
+        (requests.ConnectionError(), RuntimeError),
+    ],
+)
+def test_delta_transport_error(catalog, failure, expected):
+    with mock.patch("requests.Session") as session:
+        get = session.return_value.__enter__.return_value.get
+        get.side_effect = failure
+        with pytest.raises(expected) as caught:
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+        assert "secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert get.call_args.kwargs["timeout"] == 10
+        assert get.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("missing_requests_json_error", [False, True])
+def test_delta_invalid_json(catalog, monkeypatch, missing_requests_json_error):
+    if missing_requests_json_error:
+        monkeypatch.delattr(requests.exceptions, "JSONDecodeError", raising=False)
+    error_class = getattr(requests.exceptions, "JSONDecodeError", json.JSONDecodeError)
+    error = error_class("bad", "secret", 0)
+    with mock.patch("requests.Session") as session:
+        response = session.return_value.__enter__.return_value.get.return_value
+        response.status_code = 200
+        response.json.side_effect = error
+        with pytest.raises(ValueError, match="invalid JSON") as caught:
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+        formatted = "".join(traceback.format_exception(caught.value))
+        assert "secret" not in formatted
+
+
+def test_delta_response_body_timeout(monkeypatch):
+    """A stalled body is wrapped by requests in ConnectionError."""
+    body_sent = threading.Event()
+    release = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{")
+            self.wfile.flush()
+            body_sent.set()
+            release.wait(timeout=5)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setattr("ray.data.catalog._GRAVITINO_MAIN_API_TIMEOUT_S", 0.5)
+        catalog = GravitinoCatalog(
+            uri=f"http://127.0.0.1:{server.server_port}",
+            metalake="test",
+            main_api_headers={"Authorization": "Bearer timeout-secret"},
+        )
+        with pytest.raises(TimeoutError, match="timed out") as caught:
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+        assert body_sent.is_set()
+        formatted = "".join(traceback.format_exception(caught.value))
+        assert "timeout-secret" not in formatted
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"code": 2}, {"code": False}])
+def test_delta_invalid_response(catalog, payload):
+    with mock.patch("requests.Session") as session:
+        response = session.return_value.__enter__.return_value.get.return_value
+        response.status_code = 200
+        response.json.return_value = payload
+        with pytest.raises(ValueError, match="invalid response"):
+            catalog.resolve("cat.db.tbl", reader=ReaderFormat.DELTA)
+
+
+@pytest.mark.parametrize("headers", ["secret", [], {"Authorization": 1}, {1: "secret"}])
+def test_delta_invalid_headers(headers):
+    with pytest.raises(ValueError) as caught:
+        GravitinoCatalog(
+            uri="http://example", metalake="test", main_api_headers=headers
+        )
+    assert "secret" not in str(caught.value)
 
 
 if __name__ == "__main__":

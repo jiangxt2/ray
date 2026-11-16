@@ -12,7 +12,7 @@ from dataclasses import KW_ONLY, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import quote, urljoin, urlparse, urlsplit
 
 from packaging.version import parse as parse_version
 
@@ -52,6 +52,7 @@ _AZURE_STORAGE_SAS_TOKEN_OPTION = "azure_storage_sas_token"
 
 # PyIceberg introduced Basic and noop REST auth managers in 0.10.0.
 _GRAVITINO_PYICEBERG_VERSION_MIN = "0.10.0"
+_GRAVITINO_MAIN_API_TIMEOUT_S = 10
 
 
 def _parse_azure_url(url: str) -> Tuple[str, str, str]:
@@ -532,20 +533,19 @@ class GravitinoCatalog(Catalog):
 
     This adapter maps Gravitino table names to Ray Data reader/writer
     configuration. Iceberg uses an explicitly configured PyIceberg REST catalog.
-    It performs no metadata requests and does not require the Gravitino Python
-    SDK.
+    Delta resolves registered external tables through the Gravitino main API.
+    Neither path requires the Gravitino Python SDK.
 
-    Resolving tables requires PyIceberg 0.10.0 or later for REST authentication,
+    Resolving Iceberg tables requires PyIceberg 0.10.0 or later for REST authentication,
     including the default ``noop`` authentication manager. Install it with
     ``pip install -U "pyiceberg>=0.10.0"``.
 
     Args:
         uri: Gravitino main API base URI, for example
-            ``"http://gravitino:8090"``. Reserved for future format-specific
-            resolution; Iceberg does not contact this endpoint.
-        metalake: Non-empty metalake name retained for future format-specific
-            resolution. The Iceberg REST endpoint must serve this metalake;
-            this adapter does not verify that binding.
+            ``"http://gravitino:8090"``. Iceberg does not contact this endpoint.
+        metalake: Non-empty metalake name for Delta resolution. The Iceberg REST
+            endpoint must serve this metalake; this adapter does not verify that
+            binding.
         iceberg_rest_uri: Explicit Iceberg REST endpoint, for example
             ``"http://gravitino:9001/iceberg/"``. Required when resolving Iceberg
             tables; endpoint discovery is not implemented.
@@ -562,6 +562,8 @@ class GravitinoCatalog(Catalog):
             follow PyIceberg's configuration merging rules; this is not general
             configuration isolation. Don't rely on configuration files or
             environment variables to supply authentication settings.
+        main_api_headers: Optional HTTP headers for the Gravitino main API, such
+            as an ``Authorization`` header. Used only for Delta resolution.
 
     Example:
         >>> import ray
@@ -575,9 +577,12 @@ class GravitinoCatalog(Catalog):
         ... )
 
     Note:
-        The initial scope is existing-table reads and same-schema append writes.
+        Iceberg supports existing-table reads and same-schema append writes.
         Other native Iceberg write modes have not been validated through this
-        provider. Delta and Parquet access are unsupported.
+        provider. Delta supports reads of registered external tables in a
+        Generic Lakehouse catalog. Delta writes and Parquet are unsupported.
+        The caller supplies the storage identity needed to read the Delta log
+        and data files; Gravitino metadata access does not grant storage access.
         The REST service's dynamic catalog configuration binds the metalake;
         the catalog component of ``catalog.schema.table`` selects its warehouse.
         Table existence is checked during actual REST operations. Catalog
@@ -596,6 +601,9 @@ class GravitinoCatalog(Catalog):
     metalake: str
     iceberg_rest_uri: Optional[str] = None
     iceberg_rest_catalog_kwargs: Optional[Dict[str, Any]] = field(
+        default=None, repr=False, compare=False
+    )
+    main_api_headers: Optional[Dict[str, str]] = field(
         default=None, repr=False, compare=False
     )
 
@@ -618,6 +626,15 @@ class GravitinoCatalog(Catalog):
             "iceberg_rest_catalog_kwargs",
             dict(self.iceberg_rest_catalog_kwargs or {}),
         )
+        if self.main_api_headers is not None and (
+            not isinstance(self.main_api_headers, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in self.main_api_headers.items()
+            )
+        ):
+            raise ValueError("main_api_headers must be a dictionary of strings.")
+        object.__setattr__(self, "main_api_headers", dict(self.main_api_headers or {}))
 
     @staticmethod
     def _normalize_http_uri(uri: str, name: str) -> str:
@@ -658,20 +675,24 @@ class GravitinoCatalog(Catalog):
         reader: ReaderFormat,
         mode: CatalogAccessMode = CatalogAccessMode.READ,
     ) -> ResolvedSource:
-        """Resolve a Gravitino table to an Iceberg REST configuration.
+        """Resolve a Gravitino table for the requested format.
 
         Args:
             table: Three-part ``catalog.schema.table`` identifier.
-            reader: Requested table format; only Iceberg is supported.
+            reader: Requested table format; Iceberg and Delta are supported.
             mode: Requested read or write access mode.
 
         Returns:
-            The PyIceberg catalog configuration and table identifier.
+            The PyIceberg configuration or external Delta table location.
         """
         if not isinstance(reader, ReaderFormat):
             raise ValueError("reader must be a ReaderFormat value.")
         if not isinstance(mode, CatalogAccessMode):
             raise ValueError("mode must be a CatalogAccessMode value.")
+        if reader is ReaderFormat.DELTA:
+            if mode is not CatalogAccessMode.READ:
+                raise ValueError("GravitinoCatalog does not support Delta writes.")
+            return self._resolve_delta(table)
         if reader is not ReaderFormat.ICEBERG:
             raise ValueError(
                 f"GravitinoCatalog does not support format={reader.value!r}."
@@ -724,3 +745,93 @@ class GravitinoCatalog(Catalog):
             table_identifier=f"{schema_name}.{table_name}",
             data_format=ReaderFormat.ICEBERG,
         )
+
+    def _resolve_delta(self, table: str) -> ResolvedSource:
+        import requests
+
+        catalog, schema, name = self._split_table_identifier(table)
+        components = (self.metalake, catalog, schema, name)
+        if any(part in (".", "..") for part in components):
+            raise ValueError(
+                "Gravitino identifier components must not be dot segments."
+            )
+        metalake, catalog, schema, name = (quote(part, safe="") for part in components)
+        catalog_path = f"api/metalakes/{metalake}/catalogs/{catalog}"
+        table_path = f"{catalog_path}/schemas/{schema}/tables/{name}"
+        headers = dict(self.main_api_headers or {})
+        # Set the protocol header even if the caller supplied a differently cased key.
+        headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+        headers["Accept"] = "application/vnd.gravitino.v1+json"
+
+        with requests.Session() as session:
+            # An explicit auth handler prevents requests from replacing supplied
+            # Authorization headers with ambient .netrc credentials.
+            session.auth = lambda request: request
+            catalog_response = self._get_main_api(session, catalog_path, headers)
+            catalog_info = catalog_response.get("catalog")
+            if not isinstance(catalog_info, dict):
+                raise ValueError("Gravitino catalog metadata is missing or invalid.")
+            if catalog_info.get("provider") != "lakehouse-generic":
+                raise ValueError(
+                    "Gravitino Delta requires a lakehouse-generic catalog."
+                )
+            table_response = self._get_main_api(session, table_path, headers)
+
+        table_info = table_response.get("table")
+        properties = (
+            table_info.get("properties") if isinstance(table_info, dict) else None
+        )
+        if not isinstance(properties, dict):
+            raise ValueError("Gravitino Delta table properties are missing or invalid.")
+        table_format = properties.get("format")
+        external = properties.get("external")
+        location = properties.get("location")
+        if not isinstance(table_format, str) or table_format.lower() != "delta":
+            raise ValueError("Gravitino table format must be delta.")
+        if not isinstance(external, str) or external.lower() != "true":
+            raise ValueError("Gravitino Delta table must be external.")
+        if not isinstance(location, str) or not location.strip():
+            raise ValueError("Gravitino Delta table location is missing or invalid.")
+        return ResolvedSource(path=location, data_format=ReaderFormat.DELTA)
+
+    def _get_main_api(self, session: Any, path: str, headers: Dict[str, str]) -> dict:
+        import requests
+        from urllib3.exceptions import ReadTimeoutError
+
+        try:
+            response = session.get(
+                self.uri + path,
+                headers=headers,
+                timeout=_GRAVITINO_MAIN_API_TIMEOUT_S,
+                allow_redirects=False,
+            )
+        except requests.Timeout:
+            raise TimeoutError("Gravitino main API request timed out.") from None
+        except requests.ConnectionError as exc:
+            # Requests wraps response-body read timeouts in ConnectionError.
+            if exc.args and isinstance(exc.args[0], ReadTimeoutError):
+                raise TimeoutError("Gravitino main API request timed out.") from None
+            raise RuntimeError("Gravitino main API request failed.") from None
+        except requests.RequestException:
+            raise RuntimeError("Gravitino main API request failed.") from None
+        if response.status_code in (401, 403):
+            raise PermissionError(
+                f"Gravitino main API denied access (HTTP {response.status_code})."
+            )
+        if response.status_code == 404:
+            raise FileNotFoundError("Gravitino catalog or table was not found.")
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(
+                f"Gravitino main API request failed (HTTP {response.status_code})."
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ValueError("Gravitino main API returned invalid JSON.") from None
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("code")) is not int
+            or payload["code"] != 0
+        ):
+            raise ValueError("Gravitino main API returned an invalid response.")
+        return payload
