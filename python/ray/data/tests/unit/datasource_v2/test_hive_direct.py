@@ -1505,6 +1505,25 @@ def test_partition_integer_bounds_checked_before_file_planning():
         )
 
 
+def test_partition_pruner_uses_typed_values_and_null_semantics():
+    from ray.data._internal.datasource_v2.formats.hive.hive_direct import (
+        _HivePartitionPruner,
+    )
+    from ray.data.expressions import col, lit
+
+    predicate = (col("dt") >= lit(date(2026, 9, 2))) & (col("region") == "us")
+    pruner = _HivePartitionPruner(_PARTITION_FIELDS, _PARTITION_LOCATIONS, predicate)
+    assert not pruner.should_include("/warehouse/p1/file.parquet")
+    assert not pruner.should_include("/warehouse/p2/file.parquet")
+    assert not pruner.should_include("/warehouse/p3/file.parquet")
+
+    null_pruner = _HivePartitionPruner(
+        _PARTITION_FIELDS, _PARTITION_LOCATIONS, col("dt").is_null()
+    )
+    assert null_pruner.should_include("/warehouse/p3/file.parquet")
+    assert not null_pruner.should_include("/warehouse/p1/file.parquet")
+
+
 if __name__ == "__main__":
     import sys
 

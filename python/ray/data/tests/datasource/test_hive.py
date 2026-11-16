@@ -344,7 +344,7 @@ def test_direct_empty_table_preserves_schema(
 
 
 @pytest.mark.parametrize("file_format", ["parquet", "orc"])
-def test_direct_api_partitioned_read_synthesizes_and_filters_residual(
+def test_direct_api_partitioned_read_synthesizes_and_prunes(
     ray_start_regular_shared, tmp_path, monkeypatch, file_format
 ):
     from datetime import date

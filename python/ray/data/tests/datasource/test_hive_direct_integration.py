@@ -959,6 +959,9 @@ def test_partitioned_native_read_matches_hs2(direct_runtime, backend, file_forma
 
         from ray.data.expressions import col
 
+        # Construction samples before filters exist. Removing this root now
+        # proves execution neither lists nor reads the pruned partition.
+        fs.delete_dir(f"{path}/dt=2026-09-01/region=us")
         filtered = dataset.filter(
             expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 12)
         ).take_all()
