@@ -1673,6 +1673,123 @@ def test_partitioned_table_without_partitions_reads_empty(tmp_path):
     assert source._listing_roots == ()
 
 
+# ---------------------------------------------------------------------------
+# Partition pruning: typed predicates drop whole partition locations.
+# ---------------------------------------------------------------------------
+
+from ray.data.expressions import col, lit  # noqa: E402
+
+
+def test_partition_pruner_uses_typed_values_and_null_semantics():
+    from ray.data._internal.datasource_v2.formats.hive.hive_direct import (
+        _HivePartitionPruner,
+    )
+
+    predicate = (col("dt") >= lit(date(2026, 9, 2))) & (col("region") == "us")
+    pruner = _HivePartitionPruner(_PARTITION_FIELDS, _PARTITION_LOCATIONS, predicate)
+    assert not pruner.should_include("/warehouse/p1/file.parquet")
+    assert not pruner.should_include("/warehouse/p2/file.parquet")
+    # The NULL partition value never satisfies a range comparison.
+    assert not pruner.should_include("/warehouse/p3/file.parquet")
+
+    null_pruner = _HivePartitionPruner(
+        _PARTITION_FIELDS, _PARTITION_LOCATIONS, col("dt").is_null()
+    )
+    assert null_pruner.should_include("/warehouse/p3/file.parquet")
+    assert not null_pruner.should_include("/warehouse/p1/file.parquet")
+
+
+def test_partitioned_scanner_accepts_and_declines_partition_predicates(tmp_path):
+    partition = tmp_path / "p1"
+    partition.mkdir()
+    source = HiveDirectDatasource(
+        _partitioned_table(
+            tmp_path,
+            "parquet",
+            [(partition, (date(2026, 9, 1), "us"))],
+        )
+    )
+    scanner = source.create_scanner(source.infer_schema(None))
+    assert scanner.partition_columns == {"dt", "region"}
+    assert scanner.pushed_partition_pruner() is None
+    accepted = scanner.prune_partitions(col("region") == "us")
+    assert accepted is not scanner
+    assert accepted.pushed_partition_pruner() is not None
+    # A data-column predicate cannot be proven over partition values: the
+    # push is declined wholesale so the Filter survives above the read.
+    assert scanner.prune_partitions(col("id") > lit(0)) is scanner
+
+
+@pytest.mark.parametrize("file_format", ["parquet", "orc"])
+def test_partitioned_pruning_drops_splits(tmp_path, file_format):
+    first = tmp_path / "p1"
+    second = tmp_path / "p2"
+    first.mkdir()
+    second.mkdir()
+    first_file = _write_table_file(
+        first / "part-00", file_format, pa.table({"id": pa.array([1], type=pa.int64())})
+    )
+    second_file = _write_table_file(
+        second / "part-01",
+        file_format,
+        pa.table({"id": pa.array([2], type=pa.int64())}),
+    )
+    source = HiveDirectDatasource(
+        _partitioned_table(
+            tmp_path,
+            file_format,
+            [
+                (first, (date(2026, 9, 1), "us")),
+                (second, (date(2026, 9, 2), "eu")),
+            ],
+        )
+    )
+    scanner = source.create_scanner(source.infer_schema(None))
+    pruned = scanner.prune_partitions(
+        (col("dt") >= lit(date(2026, 9, 2))) & (col("region") == "eu")
+    )
+    kept = pruned.prune_input_split(_read_manifest([first_file, second_file]))
+    assert [str(path) for path in kept.paths] == [str(second_file)]
+
+
+def test_partitioned_indexer_skips_pruned_roots(tmp_path):
+    file_format = "orc"
+    first = tmp_path / "p1"
+    second = tmp_path / "p2"
+    first.mkdir()
+    second.mkdir()
+    _write_table_file(
+        first / "part-00", file_format, pa.table({"id": pa.array([1], type=pa.int64())})
+    )
+    _write_table_file(
+        second / "part-01",
+        file_format,
+        pa.table({"id": pa.array([2], type=pa.int64())}),
+    )
+    source = HiveDirectDatasource(
+        _partitioned_table(
+            tmp_path,
+            file_format,
+            [
+                (first, (date(2026, 9, 1), "us")),
+                (second, (date(2026, 9, 2), "eu")),
+            ],
+        )
+    )
+    scanner = source.create_scanner(source.infer_schema(None))
+    pruned = scanner.prune_partitions(col("region") == "eu")
+    indexer = source._get_file_indexer()
+    manifests = list(
+        indexer.list_files(
+            pa.array(["hive://direct"]),
+            filesystem=None,
+            pruners=[pruned.pushed_partition_pruner()],
+        )
+    )
+    listed = {str(path) for manifest in manifests for path in manifest.paths}
+    assert listed == {str(second / "part-01")}
+
+
 if __name__ == "__main__":
     import sys
 

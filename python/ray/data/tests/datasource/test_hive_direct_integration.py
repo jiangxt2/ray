@@ -1018,7 +1018,7 @@ def test_partitioned_default_partition_matches_hs2(direct_runtime):
         assert {row["dt"] for row in defaults if row["id"] >= 20} == {None}
 
 
-def test_partitioned_filter_stays_residual_and_matches_hs2(direct_runtime):
+def test_partitioned_pruning_and_residual_match_hs2(direct_runtime):
     from ray.data.expressions import col
 
     with _partitioned_file_table(
@@ -1041,7 +1041,7 @@ def test_partitioned_filter_stays_residual_and_matches_hs2(direct_runtime):
         ],
     ) as (fs, path, table, cursor, factory):
         dataset = _read_direct(table, factory, fs)
-        # Partition-key predicates stay residual above the read in this stage.
+        # Partition-key pruning composes with a residual data-column filter.
         rows = dataset.filter(
             expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 12)
         ).take_all()

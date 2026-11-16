@@ -343,7 +343,7 @@ def test_direct_empty_table_preserves_schema(
     assert dataset.schema().base_schema == declared
 
 
-def test_direct_api_partitioned_read_synthesizes_and_filters_residual(
+def test_direct_api_partitioned_read_synthesizes_and_prunes(
     ray_start_regular_shared, tmp_path, monkeypatch
 ):
     from datetime import date
@@ -396,8 +396,9 @@ def test_direct_api_partitioned_read_synthesizes_and_filters_residual(
         (4, date(2026, 9, 2), "eu"),
     }
 
-    # Partition-key filters stay residual above the read in this stage; rows
-    # still come only from the matching registered partition.
+    # The partition-key predicate is proven against the typed partition
+    # values, so the pruned read returns only the matching registered
+    # partition's rows.
     pruned = dataset.filter(expr=col("dt") >= date(2026, 9, 2))
     rows = pruned.take_all()
     assert sorted(row["id"] for row in rows) == [2, 4]
