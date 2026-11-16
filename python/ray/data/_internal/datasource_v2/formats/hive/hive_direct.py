@@ -70,6 +70,7 @@ from ray.data._internal.datasource_v2.interfaces.file_indexer import (
     FileInfo,
 )
 from ray.data._internal.datasource_v2.interfaces.file_manifest import FileManifest
+from ray.data._internal.datasource_v2.interfaces.file_pruner import FilePruner
 from ray.data._internal.datasource_v2.interfaces.synthesized_columns import (
     ReadUnitPosition,
     SynthesizedColumn,
@@ -972,13 +973,172 @@ class _HivePartitionResolver:
             for location, values in partition_locations
         }
 
-    def values_for(self, path: str) -> Optional[Tuple[Optional[object], ...]]:
+    def root_for(self, path: str) -> Optional[str]:
+        """Return the owning partition's location, or None outside all roots."""
         path = _normalize_partition_root(path)
         while path not in self._values_by_root:
             if "/" not in path:
                 return None
             path = path.rsplit("/", 1)[0]
-        return self._values_by_root[path]
+        return path
+
+    def values_for_root(self, root: str) -> Tuple[Optional[object], ...]:
+        return self._values_by_root[root]
+
+    def values_for(self, path: str) -> Optional[Tuple[Optional[object], ...]]:
+        root = self.root_for(path)
+        if root is None:
+            return None
+        return self.values_for_root(root)
+
+
+def _scalar_predicate_result(result) -> bool:
+    """Extract a single-row boolean, treating NULL as false like SQL."""
+    import numpy as np
+
+    import pandas as pd
+
+    if isinstance(result, (pa.Array, pa.ChunkedArray)):
+        assert len(result) == 1, f"Result expected to be of length 1 (got {result})"
+        value = result[0].as_py()
+        return False if value is None else bool(value)
+    if isinstance(result, np.ndarray):
+        assert len(result) == 1, f"Result expected to be of length 1 (got {result})"
+        return bool(result[0])
+    if isinstance(result, pd.Series):
+        assert len(result) == 1, f"Result expected to be of length 1 (got {result})"
+        value = result.iloc[0]
+        return False if value is None or pd.isna(value) else bool(value)
+    if isinstance(result, pa.Scalar):
+        value = result.as_py()
+        return False if value is None else bool(value)
+    return bool(result)
+
+
+def _evaluate_partition_predicate(
+    predicate: "Expr",
+    key_fields: Tuple[pa.Field, ...],
+    values: Tuple[Optional[object], ...],
+) -> bool:
+    """Evaluate one partition predicate against typed single-row values."""
+    from ray.data._internal.planner.plan_expression.expression_evaluator import (
+        NativeExpressionEvaluator,
+    )
+
+    table = pa.table(
+        {
+            field.name: pa.array([value], type=field.type)
+            for field, value in zip(key_fields, values)
+        }
+    )
+    result = NativeExpressionEvaluator(table).visit(predicate)
+    return _scalar_predicate_result(result)
+
+
+class _HivePartitionPruner(FilePruner):
+    """File-level pruner driven by catalog-typed partition values, not paths.
+
+    The predicate was proven evaluable against every registered partition's
+    values before this pruner was built (see the pruning mixin's
+    ``prune_partitions``); evaluation here cannot change the accepted
+    semantics. Results are memoized per partition: every file under one
+    location shares its partition's values.
+    """
+
+    def __init__(
+        self,
+        key_fields: Tuple[pa.Field, ...],
+        partition_locations: Tuple[Tuple[str, Tuple[Optional[object], ...]], ...],
+        predicate: "Expr",
+    ):
+        self._key_fields = tuple(key_fields)
+        self._resolver = _HivePartitionResolver(partition_locations)
+        self._predicate = predicate
+        self._include_by_root: Dict[str, bool] = {}
+
+    def should_include(self, path: str) -> bool:
+        root = self._resolver.root_for(str(path))
+        if root is None:
+            return False
+        included = self._include_by_root.get(root)
+        if included is None:
+            values = self._resolver.values_for_root(root)
+            included = _evaluate_partition_predicate(
+                self._predicate, self._key_fields, values
+            )
+            self._include_by_root[root] = included
+        return included
+
+
+class _HivePartitionPruningMixin:
+    """Typed partition pruning for Hive scanners.
+
+    Values come from the metastore, so only predicates proven evaluable
+    against every registered partition are accepted; anything else stays a
+    residual filter above the read, where synthesized columns already exist.
+    """
+
+    partition_key_fields: Tuple[pa.Field, ...] = ()
+    partition_locations: Tuple[Tuple[str, Tuple[Optional[object], ...]], ...] = ()
+
+    @property
+    def partition_columns(self) -> Set[str]:
+        return {field.name for field in self.partition_key_fields}
+
+    def prune_partitions(self, predicate: "Expr"):
+        if not self.partition_key_fields:
+            return self
+        try:
+            for _, values in self.partition_locations:
+                _evaluate_partition_predicate(
+                    predicate, self.partition_key_fields, values
+                )
+        except Exception:
+            # Never prune on semantics we cannot prove; keep the Filter.
+            return self
+        return replace(
+            self,
+            partition_predicate=combine_predicates(self.partition_predicate, predicate),
+        )
+
+    def pushed_partition_pruner(self) -> Optional[FilePruner]:
+        if self.partition_predicate is None or not self.partition_key_fields:
+            return None
+        return _HivePartitionPruner(
+            self.partition_key_fields,
+            self.partition_locations,
+            self.partition_predicate,
+        )
+
+    def _cached_partition_pruner(self) -> Optional[FilePruner]:
+        # Read tasks consult the pruner per split; build the resolver once per
+        # pickled scanner instead of once per call. Frozen dataclasses allow
+        # assignment through object.__setattr__.
+        pruner = getattr(self, "_hive_partition_pruner", None)
+        if pruner is None:
+            pruner = self.pushed_partition_pruner()
+            object.__setattr__(self, "_hive_partition_pruner", pruner)
+        return pruner
+
+    def prune_input_split(self, input_split: FileManifest) -> FileManifest:
+        pruner = self._cached_partition_pruner()
+        if pruner is None:
+            return input_split
+        keep_indices = [
+            index
+            for index, path in enumerate(input_split.paths)
+            if pruner.should_include(str(path))
+        ]
+        if len(keep_indices) == len(input_split):
+            return input_split
+        logger.debug(
+            "Hive partition pruning removed %d of %d files",
+            len(input_split) - len(keep_indices),
+            len(input_split),
+        )
+        block = input_split.as_block()
+        # An untyped empty list infers null indices: ArrowNotImplementedError.
+        return FileManifest(block.take(pa.array(keep_indices, type=pa.int64())))
 
 
 class _HivePartitionColumn(SynthesizedColumn):
@@ -1044,12 +1204,18 @@ class _HiveParquetSchemaValidatingReader(ParquetFileReader):
 
 
 @dataclass(frozen=True)
-class _HiveParquetScanner(ParquetScanner):
+class _HiveParquetScanner(_HivePartitionPruningMixin, ParquetScanner):
     """Add Hive validation while retaining native Parquet readers and metadata."""
 
     hive_schema: pa.Schema = dataclass_field(kw_only=True, repr=False)
     sampled_names: Tuple[Tuple[str, str], ...] = dataclass_field(
         kw_only=True, repr=False
+    )
+    partition_key_fields: Tuple[pa.Field, ...] = dataclass_field(
+        kw_only=True, default=(), repr=False
+    )
+    partition_locations: Tuple[Tuple[str, Tuple[Optional[object], ...]], ...] = (
+        dataclass_field(kw_only=True, default=(), repr=False)
     )
 
     @override
@@ -1273,8 +1439,13 @@ class _HiveOrcFileReader(OrcFileReader):
 
 
 @dataclass(frozen=True)
-class _HiveOrcScanner(OrcScanner):
-    """Configure native ORC reads with per-file Hive column mapping."""
+class _HiveOrcScanner(_HivePartitionPruningMixin, OrcScanner):
+    """Configure native ORC reads with per-file Hive column mapping.
+
+    The Hive mixin replaces ``OrcScanner.prune_partitions``: partition-key
+    columns never exist in Hive data files, so the predicate must not be
+    re-applied as a data filter; residual filtering happens above the read.
+    """
 
     hive_schema: pa.Schema = dataclass_field(kw_only=True, repr=False)
     sampled_names: Tuple[Tuple[str, str], ...] = dataclass_field(
@@ -1283,6 +1454,12 @@ class _HiveOrcScanner(OrcScanner):
     force_positional_evolution: bool = dataclass_field(kw_only=True, default=False)
     tolerate_missing_schema: bool = dataclass_field(kw_only=True, default=True)
     schema_evolution_case_sensitive: bool = dataclass_field(kw_only=True, default=False)
+    partition_key_fields: Tuple[pa.Field, ...] = dataclass_field(
+        kw_only=True, default=(), repr=False
+    )
+    partition_locations: Tuple[Tuple[str, Tuple[Optional[object], ...]], ...] = (
+        dataclass_field(kw_only=True, default=(), repr=False)
+    )
 
     @override
     def push_filters(
@@ -1426,8 +1603,20 @@ class _HiveFileIndexer(FileIndexer):
                 infos, filesystem=self._filesystem, **kwargs
             )
         else:
+            pruners = kwargs.pop("pruners", None) or []
+            partition_pruners = [
+                pruner for pruner in pruners if isinstance(pruner, _HivePartitionPruner)
+            ]
+            roots = [
+                root
+                for root in self._roots
+                if all(pruner.should_include(root) for pruner in partition_pruners)
+            ]
             yield from self._indexer.list_files(
-                pa.array(self._roots), filesystem=self._filesystem, **kwargs
+                pa.array(roots),
+                filesystem=self._filesystem,
+                pruners=pruners,
+                **kwargs,
             )
 
     def list_file_infos(
@@ -1646,4 +1835,6 @@ class HiveDirectDatasource(DataSourceWithMetadata[FileManifest]):
             **scanner_options,
             hive_schema=self._hive_schema,
             sampled_names=tuple(self._sampled_names.items()),
+            partition_key_fields=tuple(self._partition_fields),
+            partition_locations=self._partition_locations,
         )

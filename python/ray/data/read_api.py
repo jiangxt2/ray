@@ -4441,9 +4441,10 @@ def read_hive(
             Registered partitions, including multiple keys and custom
             locations, resolve through HiveServer2 on the driver; reading
             workers receive the declared typed partition values and expose
-            the keys after the data columns. Filters on partition columns
-            currently apply as residual filters after the read; partition
-            pruning is a follow-up. Queries, custom SerDes, Iceberg/Delta/
+            the keys after the data columns. Partition-key predicates that
+            can be evaluated against the declared key types prune whole
+            partition locations before file listing; other expressions stay
+            residual above the read. Queries, custom SerDes, Iceberg/Delta/
             Hudi, and Parquet positional access are unsupported. The driver
             validates Hive metadata before file planning. See Notes for
             compatibility.
