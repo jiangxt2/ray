@@ -4443,8 +4443,10 @@ def read_hive(
             workers receive the declared typed partition values and expose
             the keys after the data columns. Partition-key predicates that
             can be evaluated against the declared key types prune whole
-            partition locations before file listing; other expressions stay
-            residual above the read. Queries, custom SerDes, Iceberg/Delta/
+            partition locations during execution-time file listing; schema
+            discovery during construction can still access them. Other
+            expressions stay residual above the read. Queries, custom SerDes,
+            Iceberg/Delta/
             Hudi, and Parquet positional access are unsupported. The driver
             validates Hive metadata before file planning. See Notes for
             compatibility.

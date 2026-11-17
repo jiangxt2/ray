@@ -1041,6 +1041,9 @@ def test_partitioned_pruning_and_residual_match_hs2(direct_runtime):
         ],
     ) as (fs, path, table, cursor, factory):
         dataset = _read_direct(table, factory, fs)
+        # Construction samples before filters exist. Removing this root now
+        # proves execution neither lists nor reads the pruned partition.
+        fs.delete_dir(f"{path}/dt=2026-09-01/region=us")
         # Partition-key pruning composes with a residual data-column filter.
         rows = dataset.filter(
             expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 12)

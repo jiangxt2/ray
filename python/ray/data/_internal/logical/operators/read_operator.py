@@ -455,6 +455,12 @@ class ReadFiles(
         residual_unpushed = split.residual_predicate
         if split.partition_predicate is not None:
             new_scanner = new_scanner.prune_partitions(split.partition_predicate)
+            if new_scanner is self.scanner:
+                # A later data push can replace the scanner even when the
+                # partition predicate was declined.
+                residual_unpushed = combine_predicates(
+                    residual_unpushed, split.partition_predicate
+                )
         if split.data_predicate is not None:
             if pushes_filters:
                 # ``push_filters`` may decline part of what it was offered; that
