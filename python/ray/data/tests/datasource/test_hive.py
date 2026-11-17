@@ -343,8 +343,9 @@ def test_direct_empty_table_preserves_schema(
     assert dataset.schema().base_schema == declared
 
 
+@pytest.mark.parametrize("merge_schema", [False, True])
 def test_direct_api_partitioned_read_synthesizes_and_prunes(
-    ray_start_regular_shared, tmp_path, monkeypatch
+    ray_start_regular_shared, tmp_path, monkeypatch, merge_schema
 ):
     from datetime import date
 
@@ -382,7 +383,10 @@ def test_direct_api_partitioned_read_synthesizes_and_prunes(
     )
 
     dataset = read_hive(
-        "events", connection_factory=lambda: object(), read_mode="direct"
+        "events",
+        connection_factory=lambda: object(),
+        read_mode="direct",
+        merge_schema=merge_schema,
     )
     assert dataset.schema().names == ["id", "dt", "region"]
 
@@ -403,6 +407,18 @@ def test_direct_api_partitioned_read_synthesizes_and_prunes(
     rows = pruned.take_all()
     assert sorted(row["id"] for row in rows) == [2, 4]
     assert {row["region"] for row in rows} == {"eu"}
+
+    assert dataset.select_columns([]).count() == 4
+    assert sorted(
+        row["region"] for row in dataset.select_columns(["region"]).take_all()
+    ) == ["eu", "eu", "us", "us"]
+    limited = (
+        dataset.filter(expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 2))
+        .select_columns(["region"])
+        .limit(1)
+        .take_all()
+    )
+    assert limited == [{"region": "eu"}]
 
 
 if __name__ == "__main__":

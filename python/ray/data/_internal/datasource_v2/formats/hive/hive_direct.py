@@ -1086,7 +1086,7 @@ class _HivePartitionPruningMixin:
         return {field.name for field in self.partition_key_fields}
 
     def prune_partitions(self, predicate: "Expr"):
-        if not self.partition_key_fields:
+        if not self.partition_key_fields or not predicate.is_idempotent():
             return self
         try:
             for _, values in self.partition_locations:

@@ -1677,7 +1677,7 @@ def test_partitioned_table_without_partitions_reads_empty(tmp_path):
 # Partition pruning: typed predicates drop whole partition locations.
 # ---------------------------------------------------------------------------
 
-from ray.data.expressions import col, lit  # noqa: E402
+from ray.data.expressions import col, lit, random  # noqa: E402
 
 
 def test_partition_pruner_uses_typed_values_and_null_semantics():
@@ -1720,6 +1720,21 @@ def test_partitioned_scanner_accepts_and_declines_partition_predicates(tmp_path)
     assert scanner.prune_partitions(col("id") > lit(0)) is scanner
 
 
+def test_partitioned_scanner_declines_nondeterministic_predicates(tmp_path):
+    partition = tmp_path / "p1"
+    partition.mkdir()
+    source = HiveDirectDatasource(
+        _partitioned_table(
+            tmp_path,
+            "parquet",
+            [(partition, (date(2026, 9, 1), "us"))],
+        )
+    )
+    scanner = source.create_scanner(source.infer_schema(None))
+    predicate = (col("region") == "us") | (random() > 0.5)
+    assert scanner.prune_partitions(predicate) is scanner
+
+
 @pytest.mark.parametrize("file_format", ["parquet", "orc"])
 def test_partitioned_pruning_drops_splits(tmp_path, file_format):
     first = tmp_path / "p1"
@@ -1751,8 +1766,22 @@ def test_partitioned_pruning_drops_splits(tmp_path, file_format):
     kept = pruned.prune_input_split(_read_manifest([first_file, second_file]))
     assert [str(path) for path in kept.paths] == [str(second_file)]
 
+    import pickle
 
-def test_partitioned_indexer_skips_pruned_roots(tmp_path):
+    restored = pickle.loads(pickle.dumps(pruned))
+    assert [
+        str(path)
+        for path in restored.prune_input_split(
+            _read_manifest([first_file, second_file])
+        ).paths
+    ] == [str(second_file)]
+    projected = restored.prune_columns(["region"])
+    result = pa.concat_tables(list(projected.create_reader().read(kept)))
+    assert result.to_pylist() == [{"region": "eu"}]
+
+
+@pytest.mark.parametrize("merge_schema", [False, True])
+def test_partitioned_indexer_skips_pruned_roots(tmp_path, merge_schema):
     file_format = "orc"
     first = tmp_path / "p1"
     second = tmp_path / "p2"
@@ -1774,7 +1803,8 @@ def test_partitioned_indexer_skips_pruned_roots(tmp_path):
                 (first, (date(2026, 9, 1), "us")),
                 (second, (date(2026, 9, 2), "eu")),
             ],
-        )
+        ),
+        merge_schema=merge_schema,
     )
     scanner = source.create_scanner(source.infer_schema(None))
     pruned = scanner.prune_partitions(col("region") == "eu")
