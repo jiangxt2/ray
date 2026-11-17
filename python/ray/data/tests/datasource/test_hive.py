@@ -343,9 +343,11 @@ def test_direct_empty_table_preserves_schema(
     assert dataset.schema().base_schema == declared
 
 
-@pytest.mark.parametrize("file_format", ["parquet", "orc"])
+@pytest.mark.parametrize(
+    "file_format,merge_schema", [("parquet", False), ("orc", True)]
+)
 def test_direct_api_partitioned_read_synthesizes_and_prunes(
-    ray_start_regular_shared, tmp_path, monkeypatch, file_format
+    ray_start_regular_shared, tmp_path, monkeypatch, file_format, merge_schema
 ):
     from datetime import date
 
@@ -385,7 +387,10 @@ def test_direct_api_partitioned_read_synthesizes_and_prunes(
     )
 
     dataset = read_hive(
-        "events", connection_factory=lambda: object(), read_mode="direct"
+        "events",
+        connection_factory=lambda: object(),
+        read_mode="direct",
+        merge_schema=merge_schema,
     )
     assert dataset.schema().names == ["id", "dt", "region"]
 
@@ -466,6 +471,18 @@ def test_direct_api_rejects_ambiguous_partition_locations(
     )
     with pytest.raises(ValueError, match=match):
         read_hive("events", connection_factory=lambda: object(), read_mode="direct")
+
+    assert dataset.select_columns([]).count() == 4
+    assert sorted(
+        row["region"] for row in dataset.select_columns(["region"]).take_all()
+    ) == ["eu", "eu", "us", "us"]
+    limited = (
+        dataset.filter(expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 2))
+        .select_columns(["region"])
+        .limit(1)
+        .take_all()
+    )
+    assert limited == [{"region": "eu"}]
 
 
 if __name__ == "__main__":

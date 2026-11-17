@@ -1524,6 +1524,21 @@ def test_partition_pruner_uses_typed_values_and_null_semantics():
     assert not null_pruner.should_include("/warehouse/p1/file.parquet")
 
 
+def test_partitioned_scanner_declines_unsafe_predicates_without_io():
+    from ray.data.expressions import col, random
+
+    scanner = hive_direct._HiveParquetScanner(
+        hive_schema=pa.schema([("id", pa.int64())]),
+        sampled_names=(),
+        schema=pa.schema([("id", pa.int64())]),
+        partition_key_fields=_PARTITION_FIELDS,
+        partition_locations=_PARTITION_LOCATIONS,
+    )
+    predicate = (col("region") == "us") | (random() > 0.5)
+    assert scanner.prune_partitions(predicate) is scanner
+    assert scanner.prune_partitions(col("id") > 0) is scanner
+
+
 if __name__ == "__main__":
     import sys
 

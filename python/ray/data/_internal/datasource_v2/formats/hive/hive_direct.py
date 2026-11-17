@@ -1089,7 +1089,7 @@ class _HivePartitionPruningMixin:
         return {field.name for field in self.partition_key_fields}
 
     def prune_partitions(self, predicate: "Expr"):
-        if not self.partition_key_fields:
+        if not self.partition_key_fields or not predicate.is_idempotent():
             return self
         try:
             for _, values in self.partition_locations:
@@ -1700,6 +1700,7 @@ class HiveDirectDatasource(DataSourceWithMetadata[FileManifest]):
         )
         self._hive_schema = table.schema
         self._sampled_names = sampled_names
+        self._partition_fields = partition_fields
         self._file_format = table.file_format
         self._force_positional_evolution = table.force_positional_evolution
         self._tolerate_missing_schema = table.tolerate_missing_schema
