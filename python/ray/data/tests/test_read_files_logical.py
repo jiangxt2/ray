@@ -193,6 +193,23 @@ def test_apply_predicate_mixed_or_keeps_filter_above(tmp_path):
     assert result is op
 
 
+def test_apply_predicate_keeps_declined_partition_filter(tmp_path, monkeypatch):
+    op = _mk_partitioned_read_files(tmp_path)
+    monkeypatch.setattr(ParquetScanner, "prune_partitions", lambda self, _: self)
+    data_predicate = col("a") > 0
+    partition_predicate = col("country") == "US"
+
+    result = op.apply_predicate(data_predicate & partition_predicate)
+
+    assert isinstance(result, Filter)
+    new_read = result.input_dependencies[0]
+    assert isinstance(new_read, ReadFiles)
+    assert isinstance(new_read.scanner, ParquetScanner)
+    _assert_pred_equals(new_read.scanner.predicate, data_predicate)
+    assert new_read.scanner.partition_predicate is None
+    _assert_pred_equals(result.predicate_expr, partition_predicate)
+
+
 def test_apply_predicate_mixed_and_with_unsplittable_residual(tmp_path):
     op = _mk_partitioned_read_files(tmp_path)
 
