@@ -1505,6 +1505,40 @@ def test_partition_integer_bounds_checked_before_file_planning():
         )
 
 
+def test_partition_pruner_uses_typed_values_and_null_semantics():
+    from ray.data._internal.datasource_v2.formats.hive.hive_direct import (
+        _HivePartitionPruner,
+    )
+    from ray.data.expressions import col, lit
+
+    predicate = (col("dt") >= lit(date(2026, 9, 2))) & (col("region") == "us")
+    pruner = _HivePartitionPruner(_PARTITION_FIELDS, _PARTITION_LOCATIONS, predicate)
+    assert not pruner.should_include("/warehouse/p1/file.parquet")
+    assert not pruner.should_include("/warehouse/p2/file.parquet")
+    assert not pruner.should_include("/warehouse/p3/file.parquet")
+
+    null_pruner = _HivePartitionPruner(
+        _PARTITION_FIELDS, _PARTITION_LOCATIONS, col("dt").is_null()
+    )
+    assert null_pruner.should_include("/warehouse/p3/file.parquet")
+    assert not null_pruner.should_include("/warehouse/p1/file.parquet")
+
+
+def test_partitioned_scanner_declines_unsafe_predicates_without_io():
+    from ray.data.expressions import col, random
+
+    scanner = hive_direct._HiveParquetScanner(
+        hive_schema=pa.schema([("id", pa.int64())]),
+        sampled_names=(),
+        schema=pa.schema([("id", pa.int64())]),
+        partition_key_fields=_PARTITION_FIELDS,
+        partition_locations=_PARTITION_LOCATIONS,
+    )
+    predicate = (col("region") == "us") | (random() > 0.5)
+    assert scanner.prune_partitions(predicate) is scanner
+    assert scanner.prune_partitions(col("id") > 0) is scanner
+
+
 if __name__ == "__main__":
     import sys
 

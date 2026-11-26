@@ -959,6 +959,9 @@ def test_partitioned_native_read_matches_hs2(direct_runtime, backend, file_forma
 
         from ray.data.expressions import col
 
+        # Construction samples before filters exist. Removing this root now
+        # proves execution neither lists nor reads the pruned partition.
+        fs.delete_dir(f"{path}/dt=2026-09-01/region=us")
         filtered = dataset.filter(
             expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 12)
         ).take_all()
@@ -970,6 +973,26 @@ def test_partitioned_native_read_matches_hs2(direct_runtime, backend, file_forma
         assert sorted(filtered, key=lambda row: row["id"]) == sorted(
             expected_filtered, key=lambda row: row["id"]
         )
+
+
+def test_partitioned_bounded_string_keys_match_hs2(direct_runtime):
+    with _partitioned_file_table(
+        "id BIGINT",
+        "code CHAR(5), region VARCHAR(5)",
+        "parquet",
+        [
+            {
+                "spec": {"code": "a", "region": "xy"},
+                "rows": pa.table({"id": pa.array([0], type=pa.int64())}),
+            },
+            {
+                "spec": {"code": "longer", "region": "abcdef"},
+                "rows": pa.table({"id": pa.array([10], type=pa.int64())}),
+            },
+        ],
+    ) as (fs, path, table, cursor, factory):
+        rows = _read_direct(table, factory, fs).take_all()
+        assert sorted(rows, key=lambda row: row["id"]) == _reference_rows(cursor, table)
 
 
 def test_partitioned_custom_location_matches_hs2(direct_runtime):

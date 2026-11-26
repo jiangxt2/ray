@@ -4677,10 +4677,12 @@ def read_hive(
         read_mode: ``"hs2"`` preserves the single-query HiveServer2 path.
             ``"direct"`` uses native Parquet/ORC readers for non-ACID tables,
             including registered partitions and custom locations. Partition
-            columns appear after the data columns. Partition-column filters
-            apply as residual filters after the read in this implementation.
-            Queries, custom SerDes, Iceberg/Delta/Hudi, and Parquet positional
-            access are unsupported. See Notes for compatibility.
+            columns appear after the data columns. Safe partition-key
+            predicates prune whole locations during execution-time file
+            listing; other expressions stay residual above the read. Schema
+            discovery during construction can still access them. Queries,
+            custom SerDes, Iceberg/Delta/Hudi, and Parquet positional access
+            are unsupported. See Notes for compatibility.
         filesystem: The direct-mode filesystem, inferred from LOCATION if omitted.
             Driver and workers need storage credentials, network access and
             client dependencies; storage access doesn't inherit HS2 policies.
