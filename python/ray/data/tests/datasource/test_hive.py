@@ -415,6 +415,13 @@ def test_direct_api_partitioned_read_synthesizes_and_prunes(
         row["region"] for row in dataset.select_columns(["region"]).take_all()
     ) == ["u=s", "u=s", "us", "us"]
     assert dataset.select_columns([]).count() == 4
+    limited = (
+        dataset.filter(expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 2))
+        .select_columns(["region"])
+        .limit(1)
+        .take_all()
+    )
+    assert limited == [{"region": "u=s"}]
 
 
 def test_direct_api_partitioned_table_without_partitions(
@@ -471,18 +478,6 @@ def test_direct_api_rejects_ambiguous_partition_locations(
     )
     with pytest.raises(ValueError, match=match):
         read_hive("events", connection_factory=lambda: object(), read_mode="direct")
-
-    assert dataset.select_columns([]).count() == 4
-    assert sorted(
-        row["region"] for row in dataset.select_columns(["region"]).take_all()
-    ) == ["eu", "eu", "us", "us"]
-    limited = (
-        dataset.filter(expr=(col("dt") >= date(2026, 9, 2)) & (col("id") > 2))
-        .select_columns(["region"])
-        .limit(1)
-        .take_all()
-    )
-    assert limited == [{"region": "eu"}]
 
 
 if __name__ == "__main__":

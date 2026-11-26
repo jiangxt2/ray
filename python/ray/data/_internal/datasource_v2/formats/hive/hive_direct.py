@@ -22,17 +22,22 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TYPE_CHECKING,
     Union,
     cast,
 )
 
 from urllib.parse import unquote, urlsplit
 
+if TYPE_CHECKING:
+    from ray.data.expressions import Expr
+
 import pyarrow as pa
 import pyarrow.dataset as pds
 
 from ray.data._internal.datasource_v2.common.file_reader import FileFormat
 from ray.data._internal.datasource_v2.common.listing_utils import sample_files
+from ray.data._internal.datasource_v2.common.pushdown_utils import combine_predicates
 from ray.data._internal.datasource_v2.common.schema_inference import (
     _FULL_SCHEMA_INFERENCE_WARNING_FILE_COUNT,
     infer_schema_from_files,
