@@ -64,6 +64,7 @@ from ray.data._internal.datasource.parquet_datasource import (
     TensorColumnSchema,
 )
 from ray.data._internal.datasource.range_datasource import RangeDatasource
+from ray.data._internal.datasource.snowflake_datasource import SnowflakeDatasource
 from ray.data._internal.datasource.sql_datasource import SQLDatasource
 from ray.data._internal.datasource.text_datasource import TextDatasource
 from ray.data._internal.datasource.tfrecords_datasource import TFRecordDatasource
@@ -94,6 +95,7 @@ from ray.data._internal.stats import DatasetStats
 from ray.data._internal.tensor_extensions.utils import _create_possibly_ragged_ndarray
 from ray.data._internal.util import (
     _autodetect_parallelism,
+    _normalize_paths_to_strings,
     get_compute_strategy_for_read_api,
     get_table_block_metadata_schema,
     merge_resources_to_ray_remote_args,
@@ -650,7 +652,11 @@ def _read_datasource_v2(
         time.perf_counter() - listing_started if listing_started is not None else None
     )
     schema_started = time.perf_counter() if sample_all_files_for_schema else None
-    schema = datasource.infer_schema(sample)
+    if sample_all_files_for_schema and isinstance(datasource, FileDataSourceV2):
+        assert sample is not None
+        schema = datasource.infer_full_schema(sample, ray_remote_args=ray_remote_args)
+    else:
+        schema = datasource.infer_schema(sample)
     schema_elapsed = (
         time.perf_counter() - schema_started if schema_started is not None else None
     )
@@ -1871,13 +1877,12 @@ def read_parquet(
     .. note::
 
         ``merge_schema=True`` lists all eligible files and reads every footer during
-        planning, which can be expensive for large or remote datasets. Execution
-        reads footer metadata again. With more than 10,000 candidate files, the
-        reader warns before footer merging. Retained path and size metadata adds
-        O(files) data to serialized lineage.
-
-        Follow-up work for distributed planning-time footer reads and metadata
-        reuse is tracked in https://github.com/ray-project/ray/issues/67040.
+        planning, which can be expensive for large or remote datasets. Larger
+        eligible reads distribute schema I/O across Ray tasks. Execution reads
+        footer metadata again.
+        With more than 10,000 candidate files, the reader warns before schema
+        merging. Retained path and size metadata adds O(files) data to serialized
+        lineage.
 
         The Dataset retains those candidate paths across actions. Files appended
         after discovery aren't included. Concurrent directory traversal isn't an
@@ -2324,6 +2329,35 @@ def read_json(
     For JSON file, the whole file is read as one row.
     For JSONL file, each line of file is read as separate row.
 
+    Note:
+        The DataSourceV2 reader is selected through the ``use_datasource_v2``
+        setting of :class:`~ray.data.context.DataContext`. It splits each large
+        uncompressed JSON Lines file into byte ranges read by separate tasks:
+        every such file when ``lines=True``, else only ``.jsonl`` files.
+
+        With ``lines=False`` it parses with ``pyarrow.json``, inferring column
+        types per piece, so a column of whole numbers early in a file and
+        decimals later is int64 in some blocks and double in others. Pass
+        ``parse_options=pyarrow.json.ParseOptions(explicit_schema=...)`` to pin
+        the types. A ``.jsonl`` file larger than the chunk size is parsed only
+        as JSON Lines: unlike a whole file, a chunk can't fall back to
+        ``json.load``, so a ``.jsonl`` file holding one array raises.
+
+        With ``lines=True`` it parses with ``pandas.read_json``, as V1 does,
+        and produces pandas blocks, so the schema is known only once a block is
+        read. Each pandas block infers its own types. Strings become timestamps
+        only in columns named like dates, numeric strings become numbers, and
+        integer columns with nulls become floats. Nested objects stay Python
+        objects, and a line that is an array becomes a row with columns ``"0"``,
+        ``"1"``, and so on.
+
+        ``arrow_open_stream_args``, and JSON options other than
+        ``read_options`` and ``parse_options``, use the V1 reader. To use the
+        V1 reader everywhere, set
+        ``ray.data.DataContext.get_current().use_datasource_v2 = False``, or
+        ``RAY_DATA_USE_DATASOURCE_V2=0`` in the environment before importing
+        Ray.
+
     Examples:
         Read a JSON file in remote storage.
 
@@ -2396,7 +2430,11 @@ def read_json(
         partitioning: A :class:`~ray.data.datasource.partitioning.Partitioning` object
             that describes how paths are organized. By default, this function parses
             `Hive-style partitions <https://athena.guide/articles/\
-                hive-style-partitioning/>`_.
+                hive-style-partitioning/>`_. The partition values from a file's path
+            become columns. If the file also has a column with the same name, the
+            path value must equal the file's values, or reading raises a
+            ``ValueError``: ``country=US/a.jsonl`` with rows containing
+            ``country=CA`` fails.
         include_paths: If ``True``, include the path to each file. File paths are
             stored in the ``'path'`` column.
         ignore_missing_paths: If True, ignores any file paths in ``paths`` that are not
@@ -2441,6 +2479,44 @@ def read_json(
         for param, value in incompatible_params.items():
             if value:
                 raise ValueError(f"`{param}` is not supported when `lines=True`.")
+
+    from ray.data._internal.datasource_v2.formats.json.json_datasource_v2 import (
+        JSON_V2_ARGS,
+        JsonDatasourceV2,
+    )
+
+    if (
+        DataContext.get_current().use_datasource_v2
+        and not arrow_open_stream_args
+        and set(arrow_json_args) <= JSON_V2_ARGS
+    ):
+        datasource_v2 = JsonDatasourceV2(
+            paths=paths if isinstance(paths, list) else [paths],
+            lines=lines,
+            arrow_json_args=arrow_json_args,
+            filesystem=filesystem,
+            partitioning=partitioning,
+            file_extensions=file_extensions,
+            ignore_missing_paths=ignore_missing_paths,
+            include_paths=include_paths,
+            shuffle=shuffle,
+        )
+        return _read_datasource_v2(
+            datasource_v2,
+            parallelism=_get_num_output_blocks(parallelism, override_num_blocks),
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            ray_remote_args=ray_remote_args,
+            label_selector=label_selector,
+            fallback_strategy=fallback_strategy,
+            max_calls=max_calls,
+            resources=resources,
+            accelerator_type=accelerator_type,
+            runtime_env=runtime_env,
+            concurrency=concurrency,
+            partition_filter=partition_filter,
+        )
 
     file_based_datasource_kwargs = dict(
         filesystem=filesystem,
@@ -2517,6 +2593,27 @@ def read_csv(
 ) -> Dataset:
     """Creates a :class:`~ray.data.Dataset` from CSV files.
 
+    Note:
+        The DataSourceV2 reader is selected through the ``use_datasource_v2``
+        setting of :class:`~ray.data.context.DataContext`. It splits each large
+        uncompressed file into byte ranges read by separate tasks, unless
+        ``parse_options.newlines_in_values`` or ``parse_options.escape_char``
+        is set, ``read_options`` skips rows, or the encoding isn't UTF-8.
+        Each piece of a split file parses with its own file's header line.
+        Column types are inferred per piece, so :meth:`Dataset.schema` before
+        execution is a guess from the first about 1 MiB of up to 16 sampled
+        files, and one file's pieces can produce different types for the same
+        column. A newline inside a quoted or escaped value isn't supported in
+        split reads: a piece cut at one fails to parse (pass
+        ``parse_options=pyarrow.csv.ParseOptions(newlines_in_values=True)`` to
+        read such files whole) or can return wrong rows.
+        ``arrow_open_stream_args``, and CSV options other than
+        ``read_options``, ``parse_options`` and ``convert_options``, use the V1
+        reader. To use the V1 reader everywhere, set
+        ``ray.data.DataContext.get_current().use_datasource_v2 = False``, or
+        ``RAY_DATA_USE_DATASOURCE_V2=0`` in the environment before importing
+        Ray.
+
     Examples:
         Read a file in remote storage.
 
@@ -2583,7 +2680,13 @@ def read_csv(
 
         >>> ray.data.read_csv("s3://anonymous@ray-example-data/different-extensions/",
         ...     file_extensions=["csv"])
-        Dataset(num_rows=?, schema=Unknown schema)
+        shape: (?, 2)
+        ╭───────┬───────╮
+        │ a     ┆ b     │
+        │ ---   ┆ ---   │
+        │ int64 ┆ int64 │
+        ╰───────┴───────╯
+        (Dataset isn't materialized)
 
     Args:
         paths: A single file or directory, or a list of file or directory paths.
@@ -2613,7 +2716,11 @@ def read_csv(
         partitioning: A :class:`~ray.data.datasource.partitioning.Partitioning` object
             that describes how paths are organized. By default, this function parses
             `Hive-style partitions <https://athena.guide/articles/\
-                hive-style-partitioning/>`_.
+                hive-style-partitioning/>`_. The partition values from a file's path
+            become columns. If the file also has a column with the same name, the
+            path value must equal the file's values, or reading raises a
+            ``ValueError``: ``country=US/a.csv`` with rows containing
+            ``country=CA`` fails.
         include_paths: If ``True``, include the path to each file. File paths are
             stored in the ``'path'`` column.
         ignore_missing_paths: If True, ignores any file paths in ``paths`` that are not
@@ -2648,6 +2755,42 @@ def read_csv(
     Returns:
         :class:`~ray.data.Dataset` producing records read from the specified paths.
     """
+    from ray.data._internal.datasource_v2.formats.csv.csv_datasource_v2 import (
+        CSV_V2_ARGS,
+        CsvDatasourceV2,
+    )
+
+    if (
+        DataContext.get_current().use_datasource_v2
+        and not arrow_open_stream_args
+        and set(arrow_csv_args) <= CSV_V2_ARGS
+    ):
+        datasource_v2 = CsvDatasourceV2(
+            paths=paths if isinstance(paths, list) else [paths],
+            arrow_csv_args=arrow_csv_args,
+            filesystem=filesystem,
+            partitioning=partitioning,
+            file_extensions=file_extensions,
+            ignore_missing_paths=ignore_missing_paths,
+            include_paths=include_paths,
+            shuffle=shuffle,
+        )
+        return _read_datasource_v2(
+            datasource_v2,
+            parallelism=_get_num_output_blocks(parallelism, override_num_blocks),
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            ray_remote_args=ray_remote_args,
+            label_selector=label_selector,
+            fallback_strategy=fallback_strategy,
+            max_calls=max_calls,
+            resources=resources,
+            accelerator_type=accelerator_type,
+            runtime_env=runtime_env,
+            concurrency=concurrency,
+            partition_filter=partition_filter,
+        )
 
     datasource = CSVDatasource(
         paths,
@@ -2677,6 +2820,16 @@ def read_csv(
         runtime_env=runtime_env,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,
+    )
+
+
+def _text_read_uses_v2(arrow_open_stream_args: Optional[Dict[str, Any]]) -> bool:
+    """Whether ``read_text`` routes through DataSource V2.
+
+    V2 has no ``open_stream_args``, so those reads keep the V1 reader.
+    """
+    return (
+        DataContext.get_current().use_datasource_v2 and arrow_open_stream_args is None
     )
 
 
@@ -2712,6 +2865,16 @@ def read_text(
     """Create a :class:`~ray.data.Dataset` from lines stored in text files.
 
     The column name default to "text".
+
+    Note:
+        The DataSourceV2 reader is selected through the ``use_datasource_v2``
+        setting of :class:`~ray.data.context.DataContext`. A read that sets
+        ``arrow_open_stream_args`` uses the V1 reader. If you encounter a
+        DataSourceV2 limitation, use the V1 reader by setting
+        ``ray.data.DataContext.get_current().use_datasource_v2 = False``, or
+        ``RAY_DATA_USE_DATASOURCE_V2=0`` in the environment before importing
+        Ray. This shared setting also affects ``read_parquet()`` and
+        ``read_orc()``.
 
     Examples:
         Read a file in remote storage.
@@ -2790,6 +2953,38 @@ def read_text(
         :class:`~ray.data.Dataset` producing lines of text read from the specified
         paths.
     """
+    if _text_read_uses_v2(arrow_open_stream_args):
+        from ray.data._internal.datasource_v2.formats.text.text_datasource_v2 import (
+            TextDatasourceV2,
+        )
+
+        datasource_v2 = TextDatasourceV2(
+            paths=_normalize_paths_to_strings(paths),
+            encoding=encoding,
+            drop_empty_lines=drop_empty_lines,
+            filesystem=filesystem,
+            partitioning=partitioning,
+            file_extensions=file_extensions,
+            ignore_missing_paths=ignore_missing_paths,
+            include_paths=include_paths,
+            shuffle=shuffle,
+        )
+        return _read_datasource_v2(
+            datasource_v2,
+            parallelism=_get_num_output_blocks(parallelism, override_num_blocks),
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            ray_remote_args=ray_remote_args,
+            label_selector=label_selector,
+            fallback_strategy=fallback_strategy,
+            max_calls=max_calls,
+            resources=resources,
+            accelerator_type=accelerator_type,
+            runtime_env=runtime_env,
+            concurrency=concurrency,
+            partition_filter=partition_filter,
+        )
 
     datasource = TextDatasource(
         paths,
@@ -3069,14 +3264,11 @@ def read_orc(
     .. note::
 
         ``merge_schema=True`` lists all eligible files and reads their schemas
-        on the driver during planning, which can be expensive for large or remote
-        datasets. The reader uses the merged schema, but Ray doesn't retain per-file
-        ORC metadata from schema inference for reuse during execution.
+        during planning, which can be expensive for large or remote datasets.
+        Larger eligible reads distribute schema I/O across bounded Ray tasks.
+        Execution reads ORC metadata again.
         With more than 10,000 candidate files, Ray warns before schema merging.
         Retained path and size metadata adds O(files) data to serialized lineage.
-
-        Follow-up work for distributed planning-time schema reads and metadata
-        reuse is tracked in https://github.com/ray-project/ray/issues/67040.
 
         The Dataset retains those candidate paths across actions. Files appended
         after discovery aren't included. Concurrent directory traversal isn't an
@@ -4043,6 +4235,14 @@ def read_webdataset(
     """Create a :class:`~ray.data.Dataset` from
     `WebDataset <https://github.com/webdataset/webdataset>`_ files.
 
+    Note:
+        With ``DataContext.use_datasource_v2`` enabled:
+
+        - A field whose dtype differs between samples can fail the read.
+        - The default decoder returns grayscale images as ``(H, W, 1)``.
+        - Arrays in one field whose number of dimensions differs between
+          samples, such as ``.npy`` members, can get a leading axis of size 1.
+
     Args:
         paths: A single file/directory path or a list of file/directory paths.
             A list of paths can contain both files and directories.
@@ -4103,6 +4303,43 @@ def read_webdataset(
 
     .. _tf.train.Example: https://www.tensorflow.org/api_docs/python/tf/train/Example
     """  # noqa: E501
+
+    ctx = DataContext.get_current()
+    if ctx.use_datasource_v2:
+        from ray.data._internal.datasource_v2.formats.webdataset.webdataset_datasource_v2 import (
+            WebDatasetDatasourceV2,
+        )
+
+        datasource_v2 = WebDatasetDatasourceV2(
+            paths=paths if isinstance(paths, list) else [paths],
+            filesystem=filesystem,
+            decoder=decoder,
+            fileselect=fileselect,
+            filerename=filerename,
+            suffixes=suffixes,
+            verbose_open=verbose_open,
+            expand_json=expand_json,
+            include_paths=include_paths,
+            file_extensions=file_extensions,
+            shuffle=shuffle,
+            open_stream_args=arrow_open_stream_args,
+        )
+        return _read_datasource_v2(
+            datasource_v2,
+            parallelism=_get_num_output_blocks(parallelism, override_num_blocks),
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            ray_remote_args=ray_remote_args,
+            label_selector=label_selector,
+            fallback_strategy=fallback_strategy,
+            max_calls=max_calls,
+            resources=resources,
+            accelerator_type=accelerator_type,
+            runtime_env=runtime_env,
+            concurrency=concurrency,
+            partition_filter=partition_filter,
+        )
 
     datasource = WebDatasetDatasource(
         paths,
@@ -4292,6 +4529,7 @@ def read_hive(
     read_mode: Literal["hs2", "direct"] = "hs2",
     filesystem: Optional["pyarrow.fs.FileSystem"] = None,
     merge_schema: bool = False,
+    metadata_max_connections: int = 1,
     num_cpus: Optional[float] = None,
     memory: Optional[float] = None,
     resources: Optional[Dict[str, float]] = None,
@@ -4437,10 +4675,12 @@ def read_hive(
             data scanning. HS2 mode sends it as SQL; direct mode uses Ray's
             global limit. This argument isn't supported for query reads.
         read_mode: ``"hs2"`` preserves the single-query HiveServer2 path.
-            ``"direct"`` uses native Parquet/ORC readers for nonpartitioned,
-            non-ACID tables. Queries, custom SerDes, Iceberg/Delta/Hudi, and
-            Parquet positional access are unsupported. The driver validates
-            Hive metadata before file planning. See Notes for compatibility.
+            ``"direct"`` uses native Parquet/ORC readers for non-ACID tables,
+            including registered partitions and custom locations. Partition
+            columns appear after the data columns. Partition-column filters
+            apply as residual filters after the read in this implementation.
+            Queries, custom SerDes, Iceberg/Delta/Hudi, and Parquet positional
+            access are unsupported. See Notes for compatibility.
         filesystem: The direct-mode filesystem, inferred from LOCATION if omitted.
             Driver and workers need storage credentials, network access and
             client dependencies; storage access doesn't inherit HS2 policies.
@@ -4455,6 +4695,11 @@ def read_hive(
             snapshot and don't protect against same-path replacements.
             See https://github.com/ray-project/ray/issues/67040 for
             planning optimizations.
+        metadata_max_connections: In direct mode, the maximum number of HS2
+            sessions used for table and partition metadata, including the
+            initial table-metadata session. The default of 1 reuses that
+            session sequentially. Increase it only when the deployment permits
+            more concurrent sessions. This doesn't affect file-read parallelism.
         num_cpus: The number of CPUs to reserve for the read task.
         memory: The heap memory in bytes to reserve for the read task.
         resources: Custom resources to reserve for the read task, expressed as
@@ -4478,6 +4723,8 @@ def read_hive(
         raise TypeError("merge_schema must be a bool")
     if read_mode == "hs2" and (filesystem is not None or merge_schema):
         raise ValueError("filesystem and merge_schema require read_mode='direct'")
+    if read_mode == "hs2" and metadata_max_connections != 1:
+        raise ValueError("metadata_max_connections requires read_mode='direct'")
     if override_num_blocks is not None and (
         isinstance(override_num_blocks, bool)
         or not isinstance(override_num_blocks, int)
@@ -4496,6 +4743,7 @@ def read_hive(
         query=query,
         schema=schema,
         limit=limit,
+        metadata_max_connections=metadata_max_connections,
     )
     if read_mode == "direct":
         from ray.data._internal.datasource_v2.formats.hive.hive_direct import (
@@ -4721,6 +4969,12 @@ def read_snowflake(
 ) -> Dataset:
     """Read data from a Snowflake data set.
 
+    Ray runs the query once. Snowflake returns the result as result batches, which
+    the read tasks download in parallel as Arrow tables.
+
+    Snowflake ``NUMBER`` columns with a nonzero scale, like ``NUMBER(10, 2)``, are
+    read as ``float64``.
+
     Examples:
         >>> import ray  # doctest: +SKIP_EXAMPLE
         >>> connection_parameters = dict(
@@ -4737,7 +4991,10 @@ def read_snowflake(
         connection_parameters: Keyword arguments to pass to
             ``snowflake.connector.connect``. To view supported parameters, read
             https://docs.snowflake.com/developer-guide/python-connector/python-connector-api#functions.
-        shard_keys: The keys to shard the data by.
+        shard_keys: The keys to shard the data by. If you set this, Ray reads with
+            :func:`~ray.data.read_sql` instead, which runs a separate query for each
+            output block that selects rows by a hash of these keys. You don't need
+            this for parallel reads.
         parallelism: This argument is deprecated. Use ``override_num_blocks`` argument.
         num_cpus: The number of CPUs to reserve for each parallel read worker.
         num_gpus: The number of GPUs to reserve for each parallel read worker. For
@@ -4749,10 +5006,10 @@ def read_snowflake(
             total number of tasks run or the total number of output blocks. By default,
             concurrency is dynamically decided based on the available resources.
         override_num_blocks: Override the number of output blocks from all read tasks.
-            This is used for sharding when shard_keys is provided.
-            By default, the number of output blocks is dynamically decided based on
-            input data size and available resources. You shouldn't manually set this
-            value in most cases.
+            Without ``shard_keys``, Ray creates at most one read task per result
+            batch. By default, the number of output blocks is dynamically decided
+            based on input data size and available resources. You shouldn't manually
+            set this value in most cases.
 
         label_selector: Labels required on the node where each read task runs.
         fallback_strategy: Alternative label requirements that Ray tries in order if
@@ -4768,6 +5025,24 @@ def read_snowflake(
     Returns:
         A ``Dataset`` containing the data from the Snowflake data set.
     """  # noqa: E501
+    if shard_keys is None:
+        return read_datasource(
+            SnowflakeDatasource(sql=sql, connection_parameters=connection_parameters),
+            parallelism=parallelism,
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            ray_remote_args=ray_remote_args,
+            label_selector=label_selector,
+            fallback_strategy=fallback_strategy,
+            max_calls=max_calls,
+            resources=resources,
+            accelerator_type=accelerator_type,
+            runtime_env=runtime_env,
+            concurrency=concurrency,
+            override_num_blocks=override_num_blocks,
+        )
+
     import snowflake.connector
 
     def snowflake_connection_factory():
@@ -6197,6 +6472,14 @@ def read_lance(
 ) -> Dataset:
     """Create a :class:`~ray.data.Dataset` from one or more
     `Lance Datasets <https://lance-format.github.io/lance-python-doc/dataset.html>`_.
+
+    .. note::
+        Filtered reads leave row-count metadata unknown without scanning the
+        data during planning. ``count()`` executes the read. Non-stratified
+        ``train_test_split()`` uses materialized rows to determine split sizes.
+        Count-only reads may still read payload columns because this reader
+        does not support automatic projection pushdown. Use ``columns`` to
+        explicitly limit the columns read when appropriate.
 
     Examples:
         >>> import ray
